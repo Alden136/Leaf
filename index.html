@@ -9,6 +9,7 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <style>
   :root {
+    /* ── Interface tokens — the chrome around the page. Default: light. ── */
     --well:      #6F7671;
     --housing:   #F2F3F0;
     --rule:      #C6CAC4;
@@ -16,25 +17,41 @@
     --ink-soft:  #5C6670;
     --accent:    #1F4E5F;
     --signal:    #B4472F;
-    --paper:     #FFFFFF;
+    --field:     #FFFFFF;
+    --btn-bg:    #FFFFFF;
+    --btn-fg:    #16202B;
     --shadow:    rgba(0,0,0,.28);
-    --bar-h:     52px;
+
+    /* ── Page tokens — how the document itself is rendered. Default: day. ── */
+    --paper:       #FFFFFF;
     --page-filter: none;
 
+    --bar-h: 52px;
     --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
     --mono: ui-monospace, "Roboto Mono", "SF Mono", Menlo, Consolas, monospace;
   }
 
-  /* Reading modes recolor the housing and filter the rendered page. */
-  body[data-mode="sepia"] {
-    --well: #6B6055; --housing: #EFE7DA; --rule: #CBBFAE;
-    --ink: #2B2119; --ink-soft: #6B5D4D; --accent: #7A4A21;
+  /* Interface theme — touches only the chrome. Never the page. */
+  body[data-ui="dark"] {
+    --well:     #101315;
+    --housing:  #1B1F22;
+    --rule:     #2E3438;
+    --ink:      #D5DBDE;
+    --ink-soft: #8A9399;
+    --accent:   #7FB3C4;
+    --signal:   #D96A4E;
+    --field:    #0C0F11;
+    --btn-bg:   #D5DBDE;
+    --btn-fg:   #101315;
+    --shadow:   rgba(0,0,0,.55);
+  }
+
+  /* Page theme — touches only the rendered document. Never the chrome. */
+  body[data-page="sepia"] {
     --paper: #EFE6D6;
     --page-filter: sepia(.42) saturate(.85) brightness(.97);
   }
-  body[data-mode="night"] {
-    --well: #101315; --housing: #1B1F22; --rule: #2E3438;
-    --ink: #D5DBDE; --ink-soft: #8A9399; --accent: #7FB3C4;
+  body[data-page="night"] {
     --paper: #15191C;
     --page-filter: invert(1) hue-rotate(180deg) brightness(.92) contrast(1.05);
   }
@@ -115,7 +132,9 @@
     background: var(--paper);
     box-shadow: 0 1px 3px var(--shadow), 0 6px 16px -8px var(--shadow);
   }
-  body[data-mode="night"] .page { box-shadow: 0 0 0 1px #2B3236; }
+  body[data-page="night"] .page {
+    box-shadow: 0 0 0 1px var(--rule), 0 2px 8px -2px var(--shadow);
+  }
   .page canvas { display: block; width: 100%; height: 100%; filter: var(--page-filter); }
   .page::after {
     content: attr(data-n);
@@ -164,15 +183,35 @@
   .panel.open { display: flex; }
   .panel input {
     flex: 1; min-width: 0; font: inherit; font-size: 15px;
-    color: var(--ink); background: var(--paper);
+    color: var(--ink); background: var(--field);
     border: 1px solid var(--rule); border-radius: 6px;
     padding: 9px 11px;
   }
-  body[data-mode="night"] .panel input { background: #0C0F11; }
   .panel input:focus { outline: none; border-color: var(--accent); }
   .hits {
     font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
     white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+
+  /* Appearance panel: two independent segmented controls */
+  .panel.stack { flex-direction: column; align-items: stretch; gap: 10px; }
+  .seg-row { display: flex; align-items: center; gap: 12px; }
+  .seg-label {
+    flex: none; width: 74px;
+    font-size: 13px; color: var(--ink-soft);
+  }
+  .seg {
+    display: flex; flex: 1;
+    border: 1px solid var(--rule); border-radius: 7px; overflow: hidden;
+  }
+  .seg button {
+    flex: 1; padding: 9px 4px;
+    font-size: 13px; color: var(--ink-soft);
+    border-right: 1px solid var(--rule);
+  }
+  .seg button:last-child { border-right: 0; }
+  .seg button[aria-pressed="true"] {
+    background: var(--accent); color: var(--housing); font-weight: 560;
   }
 
   /* ── Empty state ─────────────────────────────────────────────── */
@@ -180,7 +219,7 @@
     position: absolute; inset: 0; z-index: 10;
     display: none; flex-direction: column; align-items: center; justify-content: center;
     gap: 18px; padding: 32px; text-align: center;
-    background: #6F7671; color: #FFFFFF;
+    background: var(--well); color: #FFFFFF;
   }
   body.empty #empty { display: flex; }
   #empty .mark { width: 62px; height: 78px; opacity: .9; }
@@ -188,7 +227,7 @@
   #empty p  { margin: 0; font-size: 14px; line-height: 1.5; opacity: .78; max-width: 30ch; }
   .cta {
     margin-top: 6px; padding: 12px 22px; border-radius: 7px;
-    background: #FFFFFF; color: #16202B;
+    background: var(--btn-bg); color: var(--btn-fg);
     font-size: 15px; font-weight: 560;
   }
   .cta:active { transform: translateY(1px); }
@@ -210,7 +249,14 @@
   }
 </style>
 </head>
-<body class="empty">
+<body class="empty" data-page="day" data-ui="light">
+<script>
+  /* Resolve the interface theme before anything paints. */
+  try {
+    document.body.dataset.ui =
+      matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  } catch (e) { /* keep the light default */ }
+</script>
 
 <header class="bar" id="topbar">
   <button class="btn" id="openBtn" title="Open a PDF" aria-label="Open a PDF">
@@ -247,12 +293,31 @@
   </button>
 </div>
 
+<div class="panel stack" id="appearPanel">
+  <div class="seg-row">
+    <span class="seg-label">Page</span>
+    <div class="seg" id="pageSeg" role="group" aria-label="Page theme">
+      <button data-page="day">Day</button>
+      <button data-page="sepia">Sepia</button>
+      <button data-page="night">Night</button>
+    </div>
+  </div>
+  <div class="seg-row">
+    <span class="seg-label">Interface</span>
+    <div class="seg" id="uiSeg" role="group" aria-label="Interface theme">
+      <button data-ui="light">Light</button>
+      <button data-ui="dark">Dark</button>
+      <button data-ui="auto">Auto</button>
+    </div>
+  </div>
+</div>
+
 <footer class="bar" id="bottombar">
   <button class="btn" id="searchBtn" aria-pressed="false" aria-label="Find in document">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20 20"/></svg>
   </button>
-  <button class="btn" id="modeBtn" aria-label="Reading mode">
-    <svg viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 0 0 16z"/><circle cx="12" cy="12" r="8"/></svg>
+  <button class="btn" id="appearBtn" aria-pressed="false" aria-label="Appearance">
+    <svg viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 0 0 16z" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="8"/></svg>
   </button>
   <div class="spacer"></div>
   <button class="btn" id="zoomOut" aria-label="Zoom out">
@@ -764,7 +829,9 @@ $('hitPrev').onclick = () => goToHit(hitIndex - 1);
 function closePanels() {
   $('searchPanel').classList.remove('open');
   $('jumpPanel').classList.remove('open');
+  $('appearPanel').classList.remove('open');
   $('searchBtn').setAttribute('aria-pressed', 'false');
+  $('appearBtn').setAttribute('aria-pressed', 'false');
 }
 function togglePanel(panel, input) {
   const open = panel.classList.contains('open');
@@ -796,15 +863,49 @@ $('jumpGo').onclick = doJump;
 $('jumpInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doJump(); } });
 
 /* ── Toolbar ─────────────────────────────────────────────────── */
-const MODES = ['day', 'sepia', 'night'];
-const THEME_COLOR = { day: '#F2F3F0', sepia: '#EFE7DA', night: '#1B1F22' };
-let modeIndex = 0;
-$('modeBtn').onclick = () => {
-  modeIndex = (modeIndex + 1) % MODES.length;
-  const m = MODES[modeIndex];
-  document.body.dataset.mode = m;
-  document.querySelector('meta[name="theme-color"]').content = THEME_COLOR[m];
-  status(m === 'day' ? 'Day' : m === 'sepia' ? 'Sepia' : 'Night', false, 900);
+/* ── Appearance: two independent settings ───────────────────── */
+/* Page theme changes how the document is rendered.
+   Interface theme changes the chrome. Neither touches the other. */
+
+const darkMedia = matchMedia('(prefers-color-scheme: dark)');
+const THEME_COLOR = { light: '#F2F3F0', dark: '#1B1F22' };
+
+let pageTheme = 'day';
+let uiPref = 'auto';               // 'light' | 'dark' | 'auto'
+
+const resolvedUi = () => uiPref === 'auto' ? (darkMedia.matches ? 'dark' : 'light') : uiPref;
+
+function applyAppearance() {
+  document.body.dataset.page = pageTheme;
+  document.body.dataset.ui = resolvedUi();
+  document.querySelector('meta[name="theme-color"]').content = THEME_COLOR[resolvedUi()];
+
+  for (const b of $('pageSeg').children) {
+    b.setAttribute('aria-pressed', String(b.dataset.page === pageTheme));
+  }
+  for (const b of $('uiSeg').children) {
+    b.setAttribute('aria-pressed', String(b.dataset.ui === uiPref));
+  }
+}
+
+$('pageSeg').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (b) { pageTheme = b.dataset.page; applyAppearance(); }
+});
+$('uiSeg').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (b) { uiPref = b.dataset.ui; applyAppearance(); }
+});
+darkMedia.addEventListener?.('change', () => { if (uiPref === 'auto') applyAppearance(); });
+
+applyAppearance();
+
+$('appearBtn').onclick = () => {
+  const opening = !$('appearPanel').classList.contains('open');
+  closePanels();
+  if (opening) $('appearPanel').classList.add('open');
+  $('appearBtn').setAttribute('aria-pressed', String(opening));
+  document.body.classList.remove('immersive');
 };
 
 $('zoomIn').onclick  = () => setZoom(zoom * 1.25);
