@@ -942,7 +942,9 @@ function mount(i) {
   const el = document.createElement('div');
   el.className = 'page';
   el.dataset.n = i + 1;
-  entry = { el, canvas: null, task: null, scale: 0, textEl: null, textTask: null, linkEl: null };
+  entry = { el, canvas: null, task: null, scale: 0,
+            textEl: null, textTask: null, linkEl: null,
+            textDivs: null, items: null, marked: new Set() };
   live.set(i, entry);
   placeEl(i, entry);
   pagesEl.appendChild(el);
@@ -1106,6 +1108,122 @@ async function renderPage(i, entry) {
   }
 }
 
+/* ── Text normalisation ──────────────────────────────────────────
+   Builds one folded, whitespace-collapsed string per page, plus a map
+   from every character in it back to the text item and character it came
+   from. Matches are found in the flat string, then projected back onto
+   the spans — which is what lets a phrase straddling two spans, two
+   lines, or a hyphenated line break highlight correctly.
+   ─────────────────────────────────────────────────────────────── */
+
+const DROP = /[\p{M}\p{Cf}\u00AD]/u;    // combining marks, format chars, soft hyphen
+const SPACE = /\s/;
+
+/* Fold one character: split ligatures, strip accents, lowercase.
+   "ﬁ" -> "fi", "é" -> "e", "A" -> "a". May return 0, 1 or several chars. */
+function fold(ch) {
+  let out = '';
+  for (const c of ch.normalize('NFKD')) {
+    if (DROP.test(c)) continue;
+    out += c;
+  }
+  return out.toLowerCase();
+}
+
+function normalizeQuery(q) {
+  let out = '', lastSpace = true;
+  for (const ch of q ?? '') {
+    if (SPACE.test(ch)) { if (!lastSpace) { out += ' '; lastSpace = true; } continue; }
+    const f = fold(ch);
+    if (f) { out += f; lastSpace = false; }
+  }
+  return out.trim();
+}
+
+/* items: the str-bearing entries from getTextContent(), which run exactly
+   parallel to TextLayer's textDivs. */
+function normalizeItems(items) {
+  let text = '';
+  const pos = [];              // pos[k] = { i, c } source item + char, or null for inserted space
+  let lastSpace = true;
+
+  const push = (ch, src) => {
+    if (SPACE.test(ch)) {
+      if (lastSpace) return;
+      text += ' '; pos.push(null); lastSpace = true;
+    } else {
+      text += ch; pos.push(src); lastSpace = false;
+    }
+  };
+
+  for (let i = 0; i < items.length; i++) {
+    const raw = items[i].str ?? '';
+    let end = raw.length;
+    let dehyphenated = false;
+
+    // A hyphen at a line break joins the word: "net-" + "work" -> "network".
+    if (items[i].hasEOL) {
+      const trimmed = raw.replace(/\s+$/, '');
+      if (trimmed.length && trimmed[trimmed.length - 1] === '-') {
+        end = trimmed.length - 1;
+        dehyphenated = true;
+      }
+    }
+
+    for (let c = 0; c < end; c++) {
+      for (const f of fold(raw[c])) push(f, { i, c });
+    }
+    if (items[i].hasEOL && !dehyphenated) push(' ', null);
+  }
+
+  while (text.endsWith(' ')) { text = text.slice(0, -1); pos.pop(); }
+  return { text, pos };
+}
+
+/* Every occurrence of a normalised query in a normalised page. */
+function findMatches(text, q) {
+  const out = [];
+  if (!q) return out;
+  let at = text.indexOf(q);
+  while (at >= 0) { out.push(at); at = text.indexOf(q, at + q.length); }
+  return out;
+}
+
+/* Project one match onto the items it covers.
+   Returns Map<itemIndex, {from, to}> as character ranges in that item's raw str. */
+function matchToItemRanges(pos, start, length) {
+  const byItem = new Map();
+  for (let k = start; k < start + length; k++) {
+    const p = pos[k];
+    if (!p) continue;                    // an inserted separator has no source
+    const r = byItem.get(p.i);
+    if (!r) byItem.set(p.i, { from: p.c, to: p.c + 1 });
+    else { if (p.c < r.from) r.from = p.c; if (p.c + 1 > r.to) r.to = p.c + 1; }
+  }
+  return byItem;
+}
+
+/* All matches on a page, grouped per item and sorted, ready to apply to spans.
+   Returns Map<itemIndex, Array<{from, to, ord}>>. */
+function pageHighlightPlan(text, pos, q, activeOrd = -1) {
+  const plan = new Map();
+  const starts = findMatches(text, q);
+  starts.forEach((start, ord) => {
+    for (const [item, range] of matchToItemRanges(pos, start, q.length)) {
+      if (!plan.has(item)) plan.set(item, []);
+      plan.get(item).push({ from: range.from, to: range.to, ord, active: ord === activeOrd });
+    }
+  });
+  for (const ranges of plan.values()) {
+    ranges.sort((a, b) => a.from - b.from || a.to - b.to);
+    // Defensive: never emit overlapping ranges into the DOM.
+    for (let k = 1; k < ranges.length; k++) {
+      if (ranges[k].from < ranges[k - 1].to) ranges[k].from = ranges[k - 1].to;
+    }
+  }
+  return plan;
+}
+
 /* ── Text layer, links, and outline ──────────────────────────────
    The text layer is real DOM text positioned over the canvas. It is what
    makes selection, copy, search highlighting and screen readers work — a
@@ -1113,6 +1231,7 @@ async function renderPage(i, entry) {
    ─────────────────────────────────────────────────────────────── */
 
 let activeQuery = '';
+let pendingMarkScroll = false;
 let outline = null;
 const destCache = new Map();
 
@@ -1120,6 +1239,7 @@ function dropAux(entry) {
   if (entry.textTask) { try { entry.textTask.cancel(); } catch {} entry.textTask = null; }
   if (entry.textEl) { entry.textEl.remove(); entry.textEl = null; }
   if (entry.linkEl) { entry.linkEl.remove(); entry.linkEl = null; }
+  entry.textDivs = null; entry.items = null; entry.marked?.clear();
 }
 
 async function mountAux(i, entry, page, vp) {
@@ -1132,8 +1252,18 @@ async function mountAux(i, entry, page, vp) {
   entry.el.appendChild(div);
   entry.textEl = div;
 
+  // One fetch serves both the rendered layer and the search index, so the
+  // highlight positions and the match count can never disagree.
+  let textContent;
+  try { textContent = await page.getTextContent(); } catch { return; }
+  if (live.get(i) !== entry) return;
+
+  const items = textContent.items.filter(it => it.str !== undefined);
+  if (!textCache.has(i + 1)) textCache.set(i + 1, { items, ...normalizeItems(items) });
+  entry.items = items;
+
   const layer = new pdfjsLib.TextLayer({
-    textContentSource: page.streamTextContent(),
+    textContentSource: textContent,
     container: div,
     viewport: vp,
   });
@@ -1149,7 +1279,8 @@ async function mountAux(i, entry, page, vp) {
   }
   if (live.get(i) !== entry) { dropAux(entry); return; }   // scrolled away mid-render
 
-  applyHighlights(entry);
+  entry.textDivs = layer.textDivs;
+  applyHighlights(i, entry);
   mountLinks(i, entry, page, vp);
 }
 
@@ -1222,47 +1353,68 @@ function goToPage(n) {
 }
 
 /* ── Search highlighting ─────────────────────────────────────────
-   Matches are highlighted within a single text run. pdf.js emits one run
-   per positioned chunk, so a phrase split across two runs still gets the
-   page jump but not the highlight. ── */
-function applyHighlights(entry) {
-  const root = entry.textEl;
-  if (!root) return;
+   Matches are found in the flat normalised page string and projected back
+   onto the spans through the position map, so a phrase straddling spans,
+   lines or a hyphenated break highlights across all of them.
+   ─────────────────────────────────────────────────────────────── */
+function applyHighlights(i, entry) {
+  const divs = entry.textDivs, items = entry.items;
+  if (!divs || !items) return;
 
-  for (const m of root.querySelectorAll('mark.hl')) {
-    const parent = m.parentNode;
-    parent.replaceChild(document.createTextNode(m.textContent), m);
-    parent.normalize();
+  // Restore anything previously marked, using the item strings as the source
+  // of truth rather than trying to unpick the DOM.
+  if (entry.marked?.size) {
+    for (const k of entry.marked) {
+      if (divs[k] && items[k]) divs[k].textContent = items[k].str;
+    }
+    entry.marked.clear();
+  } else {
+    entry.marked = new Set();
+  }
+  if (!activeQuery) return;
+
+  const cached = textCache.get(i + 1);
+  if (!cached) return;
+
+  const active = (hitIndex >= 0 && hits[hitIndex]?.page === i + 1) ? hits[hitIndex].ord : -1;
+  const plan = pageHighlightPlan(cached.text, cached.pos, activeQuery, active);
+
+  let activeMark = null;
+  for (const [k, ranges] of plan) {
+    const div = divs[k], item = items[k];
+    if (!div || !item) continue;              // textDivs are capped on huge pages
+    const raw = item.str;
+    const frag = document.createDocumentFragment();
+    let at = 0;
+    for (const r of ranges) {
+      if (r.from > at) frag.appendChild(document.createTextNode(raw.slice(at, r.from)));
+      const mark = document.createElement('mark');
+      mark.className = r.active ? 'hl on' : 'hl';
+      mark.textContent = raw.slice(r.from, r.to);
+      frag.appendChild(mark);
+      if (r.active && !activeMark) activeMark = mark;
+      at = r.to;
+    }
+    if (at < raw.length) frag.appendChild(document.createTextNode(raw.slice(at)));
+    div.replaceChildren(frag);
+    entry.marked.add(k);
   }
 
-  const q = activeQuery.trim().toLowerCase();
-  if (!q) return;
-
-  for (const span of root.querySelectorAll('span')) {
-    if (span.firstElementChild) continue;          // skip markedContent wrappers
-    const text = span.textContent;
-    if (!text) continue;
-    const lower = text.toLowerCase();
-    if (!lower.includes(q)) continue;
-
-    const frag = document.createDocumentFragment();
-    let pos = 0, idx = lower.indexOf(q);
-    while (idx >= 0) {
-      if (idx > pos) frag.appendChild(document.createTextNode(text.slice(pos, idx)));
-      const mark = document.createElement('mark');
-      mark.className = 'hl';
-      mark.textContent = text.slice(idx, idx + q.length);
-      frag.appendChild(mark);
-      pos = idx + q.length;
-      idx = lower.indexOf(q, pos);
-    }
-    if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
-    span.replaceChildren(frag);
+  if (activeMark && pendingMarkScroll) {
+    pendingMarkScroll = false;
+    revealMark(i, activeMark);
   }
 }
 
+/* Centre the active match, rather than just landing on its page. */
+function revealMark(i, mark) {
+  const y = geom.tops[i] + mark.offsetTop;      // one-off read, not in the scroll path
+  const target = y - (well.clientHeight - insets.top) / 2;
+  well.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+}
+
 function refreshHighlights() {
-  for (const entry of live.values()) applyHighlights(entry);
+  for (const [i, entry] of live) applyHighlights(i, entry);
 }
 
 /* ── Outline ─────────────────────────────────────────────────── */
@@ -1522,50 +1674,64 @@ well.addEventListener('pointerup', e => {
 });
 
 /* ── Search ──────────────────────────────────────────────────── */
+async function pageNorm(n) {
+  let cached = textCache.get(n);
+  if (cached) return cached;
+  try {
+    const page = await doc.getPage(n);
+    const tc = await page.getTextContent();
+    const items = tc.items.filter(it => it.str !== undefined);
+    cached = { items, ...normalizeItems(items) };
+  } catch {
+    cached = { items: [], text: '', pos: [] };
+  }
+  textCache.set(n, cached);
+  return cached;
+}
+
 async function runSearch(query) {
   const token = ++searchToken;
   hits = []; hitIndex = -1;
-  const q = query.trim().toLowerCase();
+  const q = normalizeQuery(query);
+  activeQuery = q;
+  refreshHighlights();
+
   if (!q || !doc) { $('hits').textContent = ''; return; }
 
   $('hits').textContent = '…';
   for (let n = 1; n <= doc.numPages; n++) {
     if (token !== searchToken) return;
-    let text = textCache.get(n);
-    if (text === undefined) {
-      try {
-        const page = await doc.getPage(n);
-        const tc = await page.getTextContent();
-        text = tc.items.map(i => i.str).join(' ').toLowerCase();
-      } catch { text = ''; }
-      textCache.set(n, text);
-    }
-    if (text.includes(q)) {
-      hits.push(n);
-      if (hits.length === 1) { hitIndex = 0; goToHit(0); }
-      $('hits').textContent = `${hits.length} page${hits.length === 1 ? '' : 's'}`;
-    }
+    const { text, pos } = await pageNorm(n);
+    if (token !== searchToken) return;
+
+    const starts = findMatches(text, q);
+    starts.forEach((at, ord) => hits.push({ page: n, ord, at }));
+
+    if (starts.length && hitIndex < 0) { hitIndex = 0; goToHit(0); }
+    else if (starts.length) $('hits').textContent = `${hitIndex + 1} of ${hits.length}`;
   }
   if (token !== searchToken) return;
-  $('hits').textContent = hits.length
-    ? `${hitIndex + 1} of ${hits.length}`
-    : 'No matches';
+  $('hits').textContent = hits.length ? `${hitIndex + 1} of ${hits.length}` : 'No matches';
 }
 
 function goToHit(i) {
   if (!hits.length) return;
-  hitIndex = (i + hits.length) % hits.length;
-  const n = hits[hitIndex];
-  current = n; updateCounter(); moveThumb();
-  scrollToPage(n, true);
+  hitIndex = (i % hits.length + hits.length) % hits.length;
+  const hit = hits[hitIndex];
   $('hits').textContent = `${hitIndex + 1} of ${hits.length}`;
+  pendingMarkScroll = true;
+  if (hit.page !== current) {
+    current = hit.page; updateCounter(); moveThumb();
+    scrollToPage(hit.page, false);      // revealMark centres it once highlighted
+  }
+  refreshHighlights();
 }
 
 let searchTimer;
 $('searchInput').addEventListener('input', e => {
   clearTimeout(searchTimer);
   const v = e.target.value;
-  activeQuery = v;
+  activeQuery = normalizeQuery(v);
   refreshHighlights();                 // instant on what's already on screen
   searchTimer = setTimeout(() => runSearch(v), 280);
 });
