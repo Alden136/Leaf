@@ -35,7 +35,32 @@ Two routes, and the second one is the reason this is a PWA and not just a web pa
 A PWA can't register itself in Android's "Open with" menu — that requires a native
 app with an intent filter. Share is the closest equivalent and covers most of it.
 
-## Controls
+## The library
+
+Documents you open are kept in IndexedDB, along with the page and zoom you left
+them at. Opening the app goes straight to the list; tap a document to resume.
+
+Entries are keyed by a **SHA-256 of the file's bytes**, not its name. Open the same
+PDF from Drive and then from Downloads and you get one entry, not two, and it
+resumes correctly either way. On a non-secure origin `crypto.subtle` is missing,
+so it falls back to a sampled FNV hash over the bytes — weaker, but content-addressed
+in the same way.
+
+Storage is split across two object stores on purpose: `docs` holds the small
+metadata records the list reads on every open, `files` holds the multi-megabyte
+blobs it must never touch. Listing 40 documents reads a few kilobytes.
+
+Removing a document takes two taps. There's no undo, so it asks.
+
+### The detachment trap
+
+Worth knowing if you modify the open path: pdf.js **transfers** the typed array you
+hand `getDocument()` to its worker thread, which detaches the underlying
+`ArrayBuffer`. Read it afterwards and you get zero bytes. So the file is written to
+IndexedDB *before* pdf.js ever sees it. Reorder those two steps and you'll save
+empty files with no error anywhere — the buffer just quietly becomes length zero.
+
+
 
 | Gesture | Result |
 | --- | --- |
@@ -44,6 +69,7 @@ app with an intent filter. Share is the closest equivalent and covers most of it
 | Pinch | Zoom, re-rendered crisp on release |
 | Drag the right-edge rail | Scrub through pages |
 | Tap the page counter | Jump to a page number |
+| List icon, top bar | Open the library |
 
 The circle button opens **Appearance**, which has two independent settings:
 
@@ -85,10 +111,13 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
 
 ## Things deliberately left out
 
-- No reading-position or appearance memory — both themes reset on launch. Add it
-  with `localStorage`, storing `{page, zoom, pageTheme, uiPref}` keyed on a hash
-  of the file. Note that `uiPref` should store `'auto'` as-is rather than the
+- No appearance memory — both themes still reset on launch. The library covers
+  reading position, but Page/Interface are per-session. Store `{pageTheme, uiPref}`
+  in `localStorage`, and keep `uiPref` as the literal `'auto'` rather than the
   resolved value, or Auto stops tracking the system.
+- No storage eviction. The library shows what it's using and lets you remove
+  entries, but nothing is dropped automatically. If you want a cap, evict by
+  oldest `openedAt` when `navigator.storage.estimate()` gets close to quota.
 - No text selection or copy — same missing text layer as above.
 - No annotation, form filling, or outline/bookmarks pane. `doc.getOutline()`
   gives you the last one cheaply if you want it.
