@@ -52,6 +52,14 @@ blobs it must never touch. Listing 40 documents reads a few kilobytes.
 
 Removing a document takes two taps. There's no undo, so it asks.
 
+### Where the library will not work
+
+`indexedDB.open()` throws in a sandboxed iframe and in some private-browsing
+modes. The app handles this — PDFs still open normally — but the library reports
+it plainly instead of just looking empty, because an empty list and a blocked
+database are indistinguishable otherwise. If you're testing in an embedded
+preview rather than a real origin, expect the storage-unavailable notice.
+
 ### The detachment trap
 
 Worth knowing if you modify the open path: pdf.js **transfers** the typed array you
@@ -70,6 +78,8 @@ empty files with no error anywhere — the buffer just quietly becomes length ze
 | Drag the right-edge rail | Scrub through pages |
 | Tap the page counter | Jump to a page number |
 | List icon, top bar | Open the library |
+| Contents icon, top bar | Open the outline (only shown if the PDF has one) |
+| Long-press on text | Select and copy |
 
 The circle button opens **Appearance**, which has two independent settings:
 
@@ -93,15 +103,40 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
   malformed font could run arbitrary JS), and the app additionally passes
   `isEvalSupported: false`. If you bump to 5.x or 6.x, note that `page.render()`
   changed its parameters — the `canvasContext` call here is a 4.x API.
-- **Only nearby pages hold a canvas.** Pages outside the viewport ±1 get their
-  canvas dimensions zeroed and detached, which is what actually frees the memory.
-  Without this, a 300-page PDF kills the tab.
+- **The DOM is virtualised.** Only pages in the render window exist as elements —
+  a 900-page document holds about three. Canvases outside the window have their
+  dimensions zeroed and are detached, which is what actually frees the memory.
+- **Page positions are computed, never measured.** Reading `offsetTop` forces a
+  synchronous layout, so doing it once per page inside a scroll handler is what
+  makes long documents crawl. Positions come from a prefix-sum table instead, and
+  finding the visible page is a binary search over it. If you add anything to the
+  scroll path, keep it away from `offsetTop`, `offsetHeight`, `getBoundingClientRect`
+  and bare `getComputedStyle` — the insets are cached in `insets` for this reason.
+- **Zoom swaps canvases rather than blanking them.** The old canvas stays on
+  screen, stretched by CSS, until the sharper render is ready. Dropping it first
+  makes every pinch flash empty.
+- **The page container is as wide as the widest page.** Centring an overflowing
+  box with flex or auto margins leaves its left edge unreachable by scrolling,
+  so each page is absolutely positioned within a container sized to fit.
 - **Canvas size is budgeted** to ~12M pixels. Past that, Android Chrome tends to
   hand back a blank canvas instead of throwing, so the app steps the pixel ratio
   down rather than asking for something that won't paint.
-- **Search reads text, it doesn't highlight it.** `getTextContent()` per page,
-  cached, jumping to pages that contain the term. Real in-page highlighting needs
-  a positioned text layer over each canvas — a reasonable next addition.
+- **There is a real text layer.** pdf.js `TextLayer` puts transparent, positioned
+  DOM text over each canvas, which is what makes selection, copy, search
+  highlighting and screen-reader output possible — a canvas alone offers none of
+  those. It is a *sibling* of the canvas, not a parent, so the night-mode invert
+  filter applies to the canvas only and highlights keep their colour.
+- **Highlighting is per text run.** pdf.js emits one span per positioned chunk,
+  so a phrase split across two runs still gets the page jump but not the
+  highlight. Fixing that properly means building a normalised page string with an
+  offset map back into the spans, which is how pdf.js's own find controller does it.
+- **Links are restricted to http(s).** A PDF can name any URI scheme it likes,
+  including `javascript:`. Internal links resolve through the same destination
+  cache the outline uses.
+- **The outline resolves page numbers lazily.** A destination is a page *ref*,
+  not a number, so each entry needs a `getPageIndex` round trip. Doing those up
+  front would stall opening a large table of contents, so entries render
+  immediately and their page numbers fill in as they resolve.
 
 - **Two disjoint sets of CSS variables.** Interface tokens (`--housing`, `--ink`,
   `--rule`, `--field`, `--well`…) live under `body[data-ui]`. Page tokens
@@ -118,6 +153,7 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
 - No storage eviction. The library shows what it's using and lets you remove
   entries, but nothing is dropped automatically. If you want a cap, evict by
   oldest `openedAt` when `navigator.storage.estimate()` gets close to quota.
-- No text selection or copy — same missing text layer as above.
-- No annotation, form filling, or outline/bookmarks pane. `doc.getOutline()`
-  gives you the last one cheaply if you want it.
+- No annotation or form filling.
+- No highlight for matches spanning two text runs (see above).
+- No search result count per page — the panel counts pages containing the term,
+  not individual matches.

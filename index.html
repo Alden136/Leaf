@@ -140,7 +140,8 @@
   body[data-page="night"] .page {
     box-shadow: 0 0 0 1px var(--rule), 0 2px 8px -2px var(--shadow);
   }
-  .page canvas { display: block; width: 100%; height: 100%; filter: var(--page-filter); }
+  .page canvas { position: absolute; inset: 0; display: block;
+                 width: 100%; height: 100%; filter: var(--page-filter); }
   .page::after {
     content: attr(data-n);
     position: absolute; inset: 0; display: grid; place-items: center;
@@ -314,6 +315,80 @@
     color: var(--ink);
   }
 
+  /* ── Text layer ──────────────────────────────────────────────
+     Ported from pdf.js's own viewer stylesheet. Transparent text
+     positioned over the canvas: selection, copy and highlighting all
+     come from real DOM text rather than anything drawn on the canvas.
+     Note it is a sibling of the canvas, not a parent — the night-mode
+     invert filter is on the canvas alone, so highlights keep their
+     colour instead of being inverted with the page. */
+  .textLayer {
+    position: absolute; inset: 0;
+    overflow: clip; line-height: 1;
+    text-align: initial; text-size-adjust: none;
+    forced-color-adjust: none;
+    transform-origin: 0 0;
+    caret-color: CanvasText;
+    z-index: 1;
+  }
+  .textLayer :is(span, br) {
+    color: transparent; position: absolute;
+    white-space: pre; cursor: text;
+    transform-origin: 0% 0%;
+  }
+  .textLayer ::selection { background: rgba(31, 120, 180, .35); }
+  .textLayer mark.hl {
+    background: rgba(255, 196, 0, .48);
+    color: transparent; padding: 0; border-radius: 1px;
+  }
+  .textLayer mark.hl.on { background: rgba(255, 138, 0, .72); }
+
+  /* ── Link layer ──────────────────────────────────────────────── */
+  .linkLayer { position: absolute; inset: 0; z-index: 2; }
+  .linkLayer a {
+    position: absolute; display: block; border-radius: 2px;
+    background: rgba(31, 78, 95, .001);      /* hit target without a visible tint */
+  }
+  .linkLayer a:active { background: rgba(31, 120, 180, .22); }
+
+  /* ── Outline pane ────────────────────────────────────────────── */
+  #outlineBtn { display: none; }
+  body.has-outline #outlineBtn { display: grid; }
+
+  #outline {
+    position: fixed; inset: 0; z-index: 40;
+    display: none; flex-direction: column;
+    background: var(--housing); color: var(--ink);
+  }
+  #outline.open { display: flex; }
+  #outlineList { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 4px 0 20px; }
+
+  .ol-row { display: flex; align-items: flex-start; }
+  .ol-row.here > .ol-title { color: var(--accent); font-weight: 600; }
+  .ol-twist {
+    flex: none; width: 32px; height: 34px;
+    display: grid; place-items: center; color: var(--ink-soft);
+  }
+  .ol-twist svg {
+    width: 15px; height: 15px; fill: none; stroke: currentColor;
+    stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+    transition: transform .15s;
+  }
+  .ol-twist[aria-expanded="true"] svg { transform: rotate(90deg); }
+  .ol-spacer { flex: none; width: 32px; }
+  .ol-title {
+    flex: 1; min-width: 0; text-align: left;
+    padding: 8px 14px 8px 0; font-size: 14px; line-height: 1.35;
+    color: var(--ink);
+  }
+  .ol-title:active { color: var(--accent); }
+  .ol-page {
+    flex: none; padding: 8px 14px 8px 6px;
+    font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  .ol-children[hidden] { display: none; }
+
   /* ── Status line ─────────────────────────────────────────────── */
   #status {
     position: fixed; z-index: 50; left: 50%; transform: translateX(-50%);
@@ -346,6 +421,9 @@
   </button>
   <button class="btn" id="libBtn" title="Library" aria-label="Library">
     <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+  </button>
+  <button class="btn" id="outlineBtn" title="Contents" aria-label="Contents">
+    <svg viewBox="0 0 24 24"><path d="M5 6h2M5 12h2M5 18h2M10 6h9M10 12h9M10 18h9"/></svg>
   </button>
   <div class="title" id="title">No document</div>
   <button class="counter" id="counter" title="Jump to page">—</button>
@@ -417,6 +495,19 @@
     <svg viewBox="0 0 24 24"><path d="M8 9L5 12l3 3M16 9l3 3-3 3M5 12h14"/></svg>
   </button>
 </footer>
+
+<div id="outline">
+  <header class="lib-head">
+    <div>
+      <h2>Contents</h2>
+      <span class="lib-usage" id="outlineSub"></span>
+    </div>
+    <button class="btn" id="outlineClose" aria-label="Close contents">
+      <svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg>
+    </button>
+  </header>
+  <div id="outlineList"></div>
+</div>
 
 <div id="library">
   <header class="lib-head">
@@ -674,6 +765,9 @@ async function openBuffer(buffer, name, opts = {}) {
   closeLibrary();
 
   textCache.clear(); hits = []; hitIndex = -1;
+  activeQuery = ''; outline = null; destCache.clear();
+  document.body.classList.remove('has-outline');
+  closeOutline();
   $('hits').textContent = ''; $('searchInput').value = '';
   $('jumpInput').max = doc.numPages;
 
@@ -690,6 +784,7 @@ async function openBuffer(buffer, name, opts = {}) {
   updateCounter();
   buildRail();
   clearStatus();
+  loadOutline();                       // reveals the Contents button if there is one
 
   if (resumePage > 1) status(`Resumed on page ${resumePage}`, false, 1800);
 
@@ -847,7 +942,7 @@ function mount(i) {
   const el = document.createElement('div');
   el.className = 'page';
   el.dataset.n = i + 1;
-  entry = { el, canvas: null, task: null, scale: 0 };
+  entry = { el, canvas: null, task: null, scale: 0, textEl: null, textTask: null, linkEl: null };
   live.set(i, entry);
   placeEl(i, entry);
   pagesEl.appendChild(el);
@@ -858,6 +953,7 @@ function unmount(i) {
   const entry = live.get(i);
   if (!entry) return;
   if (entry.task) { try { entry.task.cancel(); } catch {} entry.task = null; }
+  dropAux(entry);
   dropCanvas(entry);
   entry.el.remove();
   live.delete(i);
@@ -888,7 +984,11 @@ function resetDocument() {
 function layout(recomputeFit) {
   if (!doc) return;
   if (recomputeFit) { measureInsets(); fitScale = contentWidth() / baseW; }
+  const prevScale = geom.scale;
   computeGeometry();
+  // Text and link layers are positioned in absolute pixels, so a scale change
+  // strands them. renderPage rebuilds both once the new canvas is ready.
+  if (Math.abs(geom.scale - prevScale) > 0.001) for (const e of live.values()) dropAux(e);
 
   pagesEl.style.width  = geom.pagesW + 'px';
   pagesEl.style.height = geom.total + 'px';
@@ -997,6 +1097,7 @@ async function renderPage(i, entry) {
     entry.canvas = canvas;
     entry.scale = scale;
     entry.el.classList.add('ready');
+    mountAux(i, entry, page, vp);          // text + links, deliberately not awaited
   } catch (err) {
     canvas.width = canvas.height = 0;
     if (err?.name !== 'RenderingCancelledException') console.error(err);
@@ -1004,6 +1105,275 @@ async function renderPage(i, entry) {
     if (entry.task === task) entry.task = null;
   }
 }
+
+/* ── Text layer, links, and outline ──────────────────────────────
+   The text layer is real DOM text positioned over the canvas. It is what
+   makes selection, copy, search highlighting and screen readers work — a
+   canvas alone offers none of those.
+   ─────────────────────────────────────────────────────────────── */
+
+let activeQuery = '';
+let outline = null;
+const destCache = new Map();
+
+function dropAux(entry) {
+  if (entry.textTask) { try { entry.textTask.cancel(); } catch {} entry.textTask = null; }
+  if (entry.textEl) { entry.textEl.remove(); entry.textEl = null; }
+  if (entry.linkEl) { entry.linkEl.remove(); entry.linkEl = null; }
+}
+
+async function mountAux(i, entry, page, vp) {
+  if (!pdfjsLib?.TextLayer) return;
+  dropAux(entry);
+
+  const div = document.createElement('div');
+  div.className = 'textLayer';
+  div.style.setProperty('--scale-factor', vp.scale);   // pdf.js positions its spans against this
+  entry.el.appendChild(div);
+  entry.textEl = div;
+
+  const layer = new pdfjsLib.TextLayer({
+    textContentSource: page.streamTextContent(),
+    container: div,
+    viewport: vp,
+  });
+  entry.textTask = layer;
+
+  try {
+    await layer.render();
+  } catch (err) {
+    if (err?.name !== 'AbortException') console.warn('Text layer failed:', err);
+    return;
+  } finally {
+    if (entry.textTask === layer) entry.textTask = null;
+  }
+  if (live.get(i) !== entry) { dropAux(entry); return; }   // scrolled away mid-render
+
+  applyHighlights(entry);
+  mountLinks(i, entry, page, vp);
+}
+
+/* Internal links jump within the document; external ones are restricted to
+   http(s), since a PDF can name any scheme it likes. */
+async function mountLinks(i, entry, page, vp) {
+  let annots;
+  try { annots = await page.getAnnotations({ intent: 'display' }); } catch { return; }
+  if (live.get(i) !== entry) return;
+
+  const links = annots.filter(a => a.subtype === 'Link' && (a.dest || a.url));
+  if (!links.length) return;
+
+  const holder = document.createElement('div');
+  holder.className = 'linkLayer';
+
+  for (const a of links) {
+    const [x1, y1, x2, y2] = vp.convertToViewportRectangle(a.rect);
+    const el = document.createElement('a');
+    el.style.left   = Math.min(x1, x2) + 'px';
+    el.style.top    = Math.min(y1, y2) + 'px';
+    el.style.width  = Math.abs(x2 - x1) + 'px';
+    el.style.height = Math.abs(y2 - y1) + 'px';
+
+    if (a.url) {
+      let safe = false;
+      try { safe = /^https?:$/.test(new URL(a.url).protocol); } catch {}
+      if (!safe) continue;
+      el.href = a.url; el.target = '_blank'; el.rel = 'noopener noreferrer';
+      el.setAttribute('aria-label', `Open link: ${a.url}`);
+    } else {
+      el.href = '#';
+      el.setAttribute('aria-label', 'Go to linked section');
+      el.onclick = async e => {
+        e.preventDefault();
+        const p = await destToPage(a.dest);
+        if (p) goToPage(p);
+        else status('That link does not point anywhere in this document.', true);
+      };
+    }
+    holder.appendChild(el);
+  }
+  if (!holder.children.length) return;
+  entry.el.appendChild(holder);
+  entry.linkEl = holder;
+}
+
+/* Resolve a PDF destination — named or explicit — to a 1-based page number. */
+async function destToPage(dest) {
+  if (!dest || !doc) return null;
+  const key = typeof dest === 'string' ? dest : JSON.stringify(dest);
+  if (destCache.has(key)) return destCache.get(key);
+  let result = null;
+  try {
+    const explicit = typeof dest === 'string' ? await doc.getDestination(dest) : dest;
+    const ref = Array.isArray(explicit) ? explicit[0] : null;
+    if (ref && typeof ref === 'object') result = (await doc.getPageIndex(ref)) + 1;
+    else if (Number.isInteger(ref)) result = ref + 1;
+  } catch { result = null; }
+  destCache.set(key, result);
+  return result;
+}
+
+function goToPage(n) {
+  const p = clamp(n, 1, doc?.numPages || 1);
+  current = p;
+  updateCounter();
+  moveThumb();
+  scrollToPage(p, true);
+}
+
+/* ── Search highlighting ─────────────────────────────────────────
+   Matches are highlighted within a single text run. pdf.js emits one run
+   per positioned chunk, so a phrase split across two runs still gets the
+   page jump but not the highlight. ── */
+function applyHighlights(entry) {
+  const root = entry.textEl;
+  if (!root) return;
+
+  for (const m of root.querySelectorAll('mark.hl')) {
+    const parent = m.parentNode;
+    parent.replaceChild(document.createTextNode(m.textContent), m);
+    parent.normalize();
+  }
+
+  const q = activeQuery.trim().toLowerCase();
+  if (!q) return;
+
+  for (const span of root.querySelectorAll('span')) {
+    if (span.firstElementChild) continue;          // skip markedContent wrappers
+    const text = span.textContent;
+    if (!text) continue;
+    const lower = text.toLowerCase();
+    if (!lower.includes(q)) continue;
+
+    const frag = document.createDocumentFragment();
+    let pos = 0, idx = lower.indexOf(q);
+    while (idx >= 0) {
+      if (idx > pos) frag.appendChild(document.createTextNode(text.slice(pos, idx)));
+      const mark = document.createElement('mark');
+      mark.className = 'hl';
+      mark.textContent = text.slice(idx, idx + q.length);
+      frag.appendChild(mark);
+      pos = idx + q.length;
+      idx = lower.indexOf(q, pos);
+    }
+    if (pos < text.length) frag.appendChild(document.createTextNode(text.slice(pos)));
+    span.replaceChildren(frag);
+  }
+}
+
+function refreshHighlights() {
+  for (const entry of live.values()) applyHighlights(entry);
+}
+
+/* ── Outline ─────────────────────────────────────────────────── */
+async function loadOutline() {
+  outline = null;
+  destCache.clear();
+  try { outline = await doc.getOutline(); } catch { outline = null; }
+  const has = Array.isArray(outline) && outline.length > 0;
+  document.body.classList.toggle('has-outline', has);
+  return has;
+}
+
+function countOutline(items) {
+  let n = 0;
+  for (const it of items || []) n += 1 + countOutline(it.items);
+  return n;
+}
+
+function buildOutline(items, depth, container) {
+  for (const item of items) {
+    const kids = Array.isArray(item.items) ? item.items : [];
+    const row = document.createElement('div');
+    row.className = 'ol-row';
+    row.style.paddingLeft = (depth * 15) + 'px';
+
+    let childBox = null;
+    if (kids.length) {
+      const twist = document.createElement('button');
+      twist.className = 'ol-twist';
+      twist.setAttribute('aria-expanded', depth === 0 ? 'true' : 'false');
+      twist.setAttribute('aria-label', 'Expand section');
+      twist.innerHTML = '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>';
+      twist.onclick = () => {
+        const open = twist.getAttribute('aria-expanded') === 'true';
+        twist.setAttribute('aria-expanded', String(!open));
+        if (childBox) childBox.hidden = open;
+      };
+      row.appendChild(twist);
+    } else {
+      const gap = document.createElement('span');
+      gap.className = 'ol-spacer';
+      row.appendChild(gap);
+    }
+
+    const title = document.createElement('button');
+    title.className = 'ol-title';
+    title.textContent = item.title?.trim() || 'Untitled section';
+    if (item.bold) title.style.fontWeight = '650';
+    if (item.italic) title.style.fontStyle = 'italic';
+    row.appendChild(title);
+
+    const pageTag = document.createElement('span');
+    pageTag.className = 'ol-page';
+    row.appendChild(pageTag);
+
+    title.onclick = async () => {
+      if (item.url) {
+        let safe = false;
+        try { safe = /^https?:$/.test(new URL(item.url).protocol); } catch {}
+        if (safe) window.open(item.url, '_blank', 'noopener,noreferrer');
+        return;
+      }
+      const p = await destToPage(item.dest);
+      if (!p) return status('That entry does not point anywhere in this document.', true);
+      closeOutline();
+      goToPage(p);
+    };
+
+    container.appendChild(row);
+
+    // Resolve the page number lazily so a large outline opens immediately.
+    if (!item.url) {
+      destToPage(item.dest).then(p => { if (p) pageTag.textContent = p; });
+    }
+
+    if (kids.length) {
+      childBox = document.createElement('div');
+      childBox.className = 'ol-children';
+      childBox.hidden = depth !== 0;
+      buildOutline(kids, depth + 1, childBox);
+      container.appendChild(childBox);
+    }
+  }
+}
+
+function renderOutline() {
+  const list = $('outlineList');
+  list.replaceChildren();
+  if (!outline?.length) {
+    const blank = document.createElement('div');
+    blank.className = 'lib-blank';
+    blank.textContent = 'This PDF has no embedded table of contents.';
+    list.appendChild(blank);
+    $('outlineSub').textContent = '';
+    return;
+  }
+  const total = countOutline(outline);
+  $('outlineSub').textContent = `${total} entr${total === 1 ? 'y' : 'ies'}`;
+  buildOutline(outline, 0, list);
+}
+
+function openOutline() {
+  closePanels();
+  closeLibrary();
+  $('outline').classList.add('open');
+  renderOutline();
+}
+function closeOutline() { $('outline').classList.remove('open'); }
+
+$('outlineBtn').onclick = openOutline;
+$('outlineClose').onclick = closeOutline;
 
 /* ── Page rail ───────────────────────────────────────────────── */
 function buildRail() {
@@ -1195,6 +1565,8 @@ let searchTimer;
 $('searchInput').addEventListener('input', e => {
   clearTimeout(searchTimer);
   const v = e.target.value;
+  activeQuery = v;
+  refreshHighlights();                 // instant on what's already on screen
   searchTimer = setTimeout(() => runSearch(v), 280);
 });
 $('searchInput').addEventListener('keydown', e => {
@@ -1205,6 +1577,10 @@ $('hitPrev').onclick = () => goToHit(hitIndex - 1);
 
 /* ── Panels ──────────────────────────────────────────────────── */
 function closePanels() {
+  if ($('searchPanel').classList.contains('open') && activeQuery) {
+    activeQuery = '';
+    refreshHighlights();
+  }
   $('searchPanel').classList.remove('open');
   $('jumpPanel').classList.remove('open');
   $('appearPanel').classList.remove('open');
@@ -1300,9 +1676,13 @@ $('fileInput').addEventListener('change', e => {
 
 addEventListener('keydown', e => {
   if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if ($('outline').classList.contains('open')) {
+    if (e.key === 'Escape') { e.preventDefault(); closeOutline(); }
+    return;                                  // don't drive the document underneath
+  }
   if ($('library').classList.contains('open')) {
     if (e.key === 'Escape') { e.preventDefault(); closeLibrary(); }
-    return;                                  // don't drive the document underneath
+    return;
   }
   if (e.key === 'Escape') { closePanels(); return; }
   if (!doc) return;
@@ -1519,6 +1899,7 @@ async function openFromLibrary(id) {
 
 function openLibrary() {
   closePanels();
+  closeOutline();
   $('library').classList.add('open');
   renderLibrary();
 }
