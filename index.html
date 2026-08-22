@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#F2F3F0">
+<title>Leaf — PDF reader</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --well:      #6F7671;
+    --housing:   #F2F3F0;
+    --rule:      #C6CAC4;
+    --ink:       #16202B;
+    --ink-soft:  #5C6670;
+    --accent:    #1F4E5F;
+    --signal:    #B4472F;
+    --paper:     #FFFFFF;
+    --shadow:    rgba(0,0,0,.28);
+    --bar-h:     52px;
+    --page-filter: none;
+
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+    --mono: ui-monospace, "Roboto Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  /* Reading modes recolor the housing and filter the rendered page. */
+  body[data-mode="sepia"] {
+    --well: #6B6055; --housing: #EFE7DA; --rule: #CBBFAE;
+    --ink: #2B2119; --ink-soft: #6B5D4D; --accent: #7A4A21;
+    --paper: #EFE6D6;
+    --page-filter: sepia(.42) saturate(.85) brightness(.97);
+  }
+  body[data-mode="night"] {
+    --well: #101315; --housing: #1B1F22; --rule: #2E3438;
+    --ink: #D5DBDE; --ink-soft: #8A9399; --accent: #7FB3C4;
+    --paper: #15191C;
+    --page-filter: invert(1) hue-rotate(180deg) brightness(.92) contrast(1.05);
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--well); color: var(--ink);
+    font-family: var(--sans);
+    overscroll-behavior: none;
+  }
+
+  /* ── Chrome bars ─────────────────────────────────────────────── */
+  .bar {
+    position: fixed; left: 0; right: 0; z-index: 20;
+    height: var(--bar-h);
+    display: flex; align-items: center; gap: 4px;
+    padding: 0 8px;
+    background: var(--housing);
+    transition: transform .22s cubic-bezier(.4,0,.2,1);
+  }
+  #topbar    { top: 0;    border-bottom: 1px solid var(--rule); padding-top: env(safe-area-inset-top); height: calc(var(--bar-h) + env(safe-area-inset-top)); }
+  #bottombar { bottom: 0; border-top: 1px solid var(--rule);    padding-bottom: env(safe-area-inset-bottom); height: calc(var(--bar-h) + env(safe-area-inset-bottom)); }
+  body.immersive #topbar    { transform: translateY(-110%); }
+  body.immersive #bottombar { transform: translateY(110%); }
+  body.empty .bar           { transform: none !important; }
+
+  .title {
+    flex: 1; min-width: 0;
+    font-size: 14px; font-weight: 560; letter-spacing: -.01em;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .counter {
+    font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums;
+    color: var(--ink-soft); padding: 4px 8px; border: 1px solid var(--rule);
+    border-radius: 4px; background: transparent; cursor: pointer; flex: none;
+  }
+
+  button {
+    font: inherit; color: var(--ink); background: none; border: 0;
+    padding: 0; cursor: pointer;
+  }
+  .btn {
+    flex: none; width: 40px; height: 40px;
+    display: grid; place-items: center; border-radius: 6px;
+  }
+  .btn:active { background: var(--rule); }
+  .btn:disabled { opacity: .3; cursor: default; }
+  .btn svg { width: 21px; height: 21px; stroke: currentColor; fill: none;
+             stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  .btn[aria-pressed="true"] { color: var(--accent); background: var(--rule); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  .zoomval {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    min-width: 42px; text-align: center; font-variant-numeric: tabular-nums;
+  }
+  .spacer { flex: 1; }
+
+  /* ── Page well ───────────────────────────────────────────────── */
+  #well {
+    position: absolute; inset: 0;
+    overflow: auto; overscroll-behavior: contain;
+    touch-action: pan-x pan-y;      /* we own pinch */
+    -webkit-overflow-scrolling: touch;
+    padding: calc(var(--bar-h) + env(safe-area-inset-top) + 10px) 10px
+             calc(var(--bar-h) + env(safe-area-inset-bottom) + 10px);
+    scrollbar-width: none;
+  }
+  #well::-webkit-scrollbar { display: none; }
+
+  #pages { display: flex; flex-direction: column; align-items: center; gap: 10px;
+           will-change: transform; }
+
+  .page {
+    position: relative; flex: none;
+    background: var(--paper);
+    box-shadow: 0 1px 3px var(--shadow), 0 6px 16px -8px var(--shadow);
+  }
+  body[data-mode="night"] .page { box-shadow: 0 0 0 1px #2B3236; }
+  .page canvas { display: block; width: 100%; height: 100%; filter: var(--page-filter); }
+  .page::after {
+    content: attr(data-n);
+    position: absolute; inset: 0; display: grid; place-items: center;
+    font-family: var(--mono); font-size: 13px; color: #A8AEB2;
+    opacity: 1; transition: opacity .15s;
+  }
+  .page.ready::after { opacity: 0; }
+
+  /* ── Page rail (the scrubber) ────────────────────────────────── */
+  #rail {
+    position: fixed; right: 0; z-index: 15;
+    top: calc(var(--bar-h) + env(safe-area-inset-top) + 14px);
+    bottom: calc(var(--bar-h) + env(safe-area-inset-bottom) + 14px);
+    width: 26px; touch-action: none; cursor: ns-resize;
+    display: none;
+  }
+  body.has-doc #rail { display: block; }
+  #rail .tick {
+    position: absolute; right: 9px; width: 7px; height: 1px;
+    background: var(--ink); opacity: .22;
+  }
+  #rail .thumb {
+    position: absolute; right: 5px; width: 15px; height: 2px;
+    background: var(--accent); border-radius: 2px;
+    box-shadow: 0 0 0 3px var(--housing);
+    transition: top .12s linear;
+  }
+  #rail .flag {
+    position: absolute; right: 30px; transform: translateY(-50%);
+    font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums;
+    background: var(--ink); color: var(--housing);
+    padding: 4px 8px; border-radius: 4px; white-space: nowrap;
+    opacity: 0; transition: opacity .12s; pointer-events: none;
+  }
+  #rail.scrubbing .flag { opacity: 1; }
+  #rail.scrubbing .thumb { height: 3px; transition: none; }
+
+  /* ── Panels (search / jump) ──────────────────────────────────── */
+  .panel {
+    position: fixed; left: 0; right: 0; z-index: 25;
+    bottom: calc(var(--bar-h) + env(safe-area-inset-bottom));
+    background: var(--housing); border-top: 1px solid var(--rule);
+    padding: 10px; display: none; gap: 8px; align-items: center;
+  }
+  .panel.open { display: flex; }
+  .panel input {
+    flex: 1; min-width: 0; font: inherit; font-size: 15px;
+    color: var(--ink); background: var(--paper);
+    border: 1px solid var(--rule); border-radius: 6px;
+    padding: 9px 11px;
+  }
+  body[data-mode="night"] .panel input { background: #0C0F11; }
+  .panel input:focus { outline: none; border-color: var(--accent); }
+  .hits {
+    font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    white-space: nowrap; font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Empty state ─────────────────────────────────────────────── */
+  #empty {
+    position: absolute; inset: 0; z-index: 10;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 18px; padding: 32px; text-align: center;
+    background: #6F7671; color: #FFFFFF;
+  }
+  body.empty #empty { display: flex; }
+  #empty .mark { width: 62px; height: 78px; opacity: .9; }
+  #empty h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -.02em; }
+  #empty p  { margin: 0; font-size: 14px; line-height: 1.5; opacity: .78; max-width: 30ch; }
+  .cta {
+    margin-top: 6px; padding: 12px 22px; border-radius: 7px;
+    background: #FFFFFF; color: #16202B;
+    font-size: 15px; font-weight: 560;
+  }
+  .cta:active { transform: translateY(1px); }
+
+  /* ── Status line ─────────────────────────────────────────────── */
+  #status {
+    position: fixed; z-index: 30; left: 50%; transform: translateX(-50%);
+    bottom: calc(var(--bar-h) + env(safe-area-inset-bottom) + 16px);
+    background: var(--ink); color: var(--housing);
+    font-size: 13px; padding: 9px 15px; border-radius: 6px;
+    max-width: 88vw; text-align: center;
+    opacity: 0; pointer-events: none; transition: opacity .18s;
+  }
+  #status.show { opacity: 1; }
+  #status.err  { background: var(--signal); color: #fff; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { transition-duration: 0ms !important; }
+  }
+</style>
+</head>
+<body class="empty">
+
+<header class="bar" id="topbar">
+  <button class="btn" id="openBtn" title="Open a PDF" aria-label="Open a PDF">
+    <svg viewBox="0 0 24 24"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l2 2.5h7A1.5 1.5 0 0 1 19 10v7.5A1.5 1.5 0 0 1 17.5 19h-13A1.5 1.5 0 0 1 3 17.5z"/></svg>
+  </button>
+  <div class="title" id="title">No document</div>
+  <button class="counter" id="counter" title="Jump to page">—</button>
+</header>
+
+<div id="well">
+  <div id="pages"></div>
+</div>
+
+<div id="rail" aria-hidden="true">
+  <div class="thumb" id="thumb"></div>
+  <div class="flag" id="flag">1</div>
+</div>
+
+<div class="panel" id="searchPanel">
+  <input id="searchInput" type="search" placeholder="Find in document" enterkeyhint="search" autocomplete="off">
+  <span class="hits" id="hits"></span>
+  <button class="btn" id="hitPrev" aria-label="Previous match">
+    <svg viewBox="0 0 24 24"><path d="M17 14l-5-5-5 5"/></svg>
+  </button>
+  <button class="btn" id="hitNext" aria-label="Next match">
+    <svg viewBox="0 0 24 24"><path d="M7 10l5 5 5-5"/></svg>
+  </button>
+</div>
+
+<div class="panel" id="jumpPanel">
+  <input id="jumpInput" type="number" min="1" placeholder="Page number" enterkeyhint="go" inputmode="numeric">
+  <button class="btn" id="jumpGo" aria-label="Go to page">
+    <svg viewBox="0 0 24 24"><path d="M5 12h13M13 7l5 5-5 5"/></svg>
+  </button>
+</div>
+
+<footer class="bar" id="bottombar">
+  <button class="btn" id="searchBtn" aria-pressed="false" aria-label="Find in document">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20 20"/></svg>
+  </button>
+  <button class="btn" id="modeBtn" aria-label="Reading mode">
+    <svg viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 0 0 16z"/><circle cx="12" cy="12" r="8"/></svg>
+  </button>
+  <div class="spacer"></div>
+  <button class="btn" id="zoomOut" aria-label="Zoom out">
+    <svg viewBox="0 0 24 24"><path d="M6 12h12"/></svg>
+  </button>
+  <div class="zoomval" id="zoomval">100%</div>
+  <button class="btn" id="zoomIn" aria-label="Zoom in">
+    <svg viewBox="0 0 24 24"><path d="M12 6v12M6 12h12"/></svg>
+  </button>
+  <div class="spacer"></div>
+  <button class="btn" id="fitBtn" aria-label="Fit to width">
+    <svg viewBox="0 0 24 24"><path d="M8 9L5 12l3 3M16 9l3 3-3 3M5 12h14"/></svg>
+  </button>
+</footer>
+
+<div id="empty">
+  <svg class="mark" viewBox="0 0 62 78" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round">
+    <path d="M5 5h34l18 18v50H5z"/><path d="M39 5v18h18"/>
+    <path d="M16 40h30M16 50h30M16 60h19"/>
+  </svg>
+  <h1>Leaf</h1>
+  <p>Open a PDF from your files, or share one to Leaf from any other app.</p>
+  <button class="cta" id="emptyOpen">Open a PDF</button>
+</div>
+
+<div id="status"></div>
+<input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
+
+<script type="module">
+/* ─────────────────────────────────────────────────────────────────
+   Leaf — a PDF reader that runs entirely in the browser.
+   Nothing is uploaded anywhere; PDF.js decodes the file on-device.
+   ───────────────────────────────────────────────────────────────── */
+
+const PDFJS_VERSION = '4.10.38';
+const CDN_BASES = [
+  `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDFJS_VERSION}`,
+  `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build`,
+  `https://unpkg.com/pdfjs-dist@${PDFJS_VERSION}/build`,
+];
+
+const MIN_ZOOM = 0.35, MAX_ZOOM = 6;
+const RENDER_MARGIN = 1;      // pages kept rendered on each side of the viewport
+const MAX_DPR = 2;            // cap device pixel ratio — phones run out of canvas memory fast
+const MAX_CANVAS_PIXELS = 12e6;  // ~48 MB per page at 4 bytes/px
+
+const $ = id => document.getElementById(id);
+const well = $('well'), pagesEl = $('pages'), rail = $('rail');
+
+let pdfjsLib = null;
+let doc = null;
+let pageBoxes = [];           // { el, canvas, task, w0, h0, ready }
+let baseW = 612, baseH = 792; // page-1 dimensions at scale 1, used for placeholders
+let fitScale = 1, zoom = 1, current = 1;
+let textCache = new Map(), hits = [], hitIndex = -1, searchToken = 0;
+
+/* ── Utilities ───────────────────────────────────────────────── */
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+
+let statusTimer;
+function status(msg, isError = false, ms = 2400) {
+  const el = $('status');
+  el.textContent = msg;
+  el.classList.toggle('err', isError);
+  el.classList.add('show');
+  clearTimeout(statusTimer);
+  if (ms) statusTimer = setTimeout(() => el.classList.remove('show'), ms);
+}
+function clearStatus() { clearTimeout(statusTimer); $('status').classList.remove('show'); }
+
+/* ── Load PDF.js, trying each CDN in turn ────────────────────── */
+async function loadPdfjs() {
+  if (pdfjsLib) return pdfjsLib;
+  let lastErr;
+  for (const base of CDN_BASES) {
+    try {
+      const lib = await import(/* @vite-ignore */ `${base}/pdf.min.mjs`);
+      lib.GlobalWorkerOptions.workerSrc = `${base}/pdf.worker.min.mjs`;
+      pdfjsLib = lib;
+      return lib;
+    } catch (err) { lastErr = err; }
+  }
+  throw lastErr ?? new Error('PDF engine unavailable');
+}
+
+/* ── Opening a document ──────────────────────────────────────── */
+async function openFile(file) {
+  if (!file) return;
+  try {
+    const buf = await file.arrayBuffer();
+    await openBuffer(buf, file.name || 'Untitled.pdf');
+  } catch (err) {
+    console.error(err);
+    status('Could not read that file.', true);
+  }
+}
+
+async function openBuffer(buffer, name) {
+  status('Opening…', false, 0);
+  let lib;
+  try {
+    lib = await loadPdfjs();
+  } catch {
+    status('PDF engine did not load. Check your connection and reload.', true, 6000);
+    return;
+  }
+
+  let next;
+  try {
+    // isEvalSupported:false blocks script execution paths in malformed fonts.
+    next = await lib.getDocument({
+      data: new Uint8Array(buffer),
+      isEvalSupported: false,
+      disableAutoFetch: true,
+    }).promise;
+  } catch (err) {
+    console.error(err);
+    const pw = err?.name === 'PasswordException';
+    status(pw ? 'That PDF is password-protected.' : 'That file is not a readable PDF.', true, 5000);
+    return;   // the document already open, if any, is left alone
+  }
+
+  // Only now tear down the previous document.
+  cancelAll();
+  if (doc) { try { await doc.destroy(); } catch {} }
+  doc = next;
+
+  document.title = `${name} — Leaf`;
+  $('title').textContent = name;
+  document.body.classList.remove('empty');
+  document.body.classList.add('has-doc');
+
+  textCache.clear(); hits = []; hitIndex = -1;
+  $('hits').textContent = ''; $('searchInput').value = '';
+  $('jumpInput').max = doc.numPages;
+
+  const first = await doc.getPage(1);
+  const vp = first.getViewport({ scale: 1 });
+  baseW = vp.width; baseH = vp.height;
+
+  buildPages();
+  zoom = 1;
+  layout(true);
+  well.scrollTop = 0;
+  current = 1;
+  updateCounter();
+  buildRail();
+  clearStatus();
+}
+
+function buildPages() {
+  cancelAll();
+  pagesEl.replaceChildren();
+  pageBoxes = [];
+  const frag = document.createDocumentFragment();
+  for (let n = 1; n <= doc.numPages; n++) {
+    const el = document.createElement('div');
+    el.className = 'page';
+    el.dataset.n = n;
+    frag.appendChild(el);
+    pageBoxes.push({ el, canvas: null, task: null, w0: baseW, h0: baseH, ready: false });
+  }
+  pagesEl.appendChild(frag);
+  observeAll();
+}
+
+function cancelAll() {
+  for (const b of pageBoxes) {
+    if (b.task) { try { b.task.cancel(); } catch {} b.task = null; }
+  }
+}
+
+/* ── Sizing ──────────────────────────────────────────────────── */
+function wellWidth() {
+  const cs = getComputedStyle(well);
+  return well.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 26;
+}
+
+// The top bar floats over the well, so "the top of the readable area" is the padding edge.
+function topInset() {
+  return parseFloat(getComputedStyle(well).paddingTop) || 0;
+}
+
+function layout(recomputeFit) {
+  if (!doc) return;
+  if (recomputeFit) fitScale = wellWidth() / baseW;
+  cancelAll();                 // anything mid-render is now at the wrong scale
+  const scale = fitScale * zoom;
+  for (const b of pageBoxes) {
+    b.el.style.width  = Math.round(b.w0 * scale) + 'px';
+    b.el.style.height = Math.round(b.h0 * scale) + 'px';
+    if (b.ready) { b.ready = false; b.el.classList.remove('ready'); dropCanvas(b); }
+  }
+  $('zoomval').textContent = Math.round(zoom * 100) + '%';
+  renderVisible();
+}
+
+function setZoom(next, after) {
+  const z = clamp(next, MIN_ZOOM, MAX_ZOOM);
+  if (Math.abs(z - zoom) < 0.001) return;
+  zoom = z;
+  layout(false);
+  if (after) requestAnimationFrame(after);
+}
+
+/* ── Rendering ───────────────────────────────────────────────── */
+let observer = null;
+function observeAll() {
+  observer?.disconnect();
+  observer = new IntersectionObserver(entries => {
+    let changed = false;
+    for (const e of entries) if (e.isIntersecting) changed = true;
+    if (changed) scheduleRender();
+  }, { root: well, rootMargin: '200% 0px' });
+  for (const b of pageBoxes) observer.observe(b.el);
+}
+
+let renderScheduled = false;
+function scheduleRender() {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => { renderScheduled = false; renderVisible(); });
+}
+
+function visibleRange() {
+  const top = well.scrollTop + topInset(), bottom = well.scrollTop + well.clientHeight;
+  let first = pageBoxes.length, last = 0;
+  pageBoxes.forEach((b, i) => {
+    const t = b.el.offsetTop, h = b.el.offsetHeight;
+    if (t + h > top && t < bottom) { first = Math.min(first, i); last = Math.max(last, i); }
+  });
+  if (first > last) { first = last = clamp(current - 1, 0, pageBoxes.length - 1); }
+  return [first, last];
+}
+
+function renderVisible() {
+  if (!doc) return;
+  const [first, last] = visibleRange();
+  const lo = Math.max(0, first - RENDER_MARGIN);
+  const hi = Math.min(pageBoxes.length - 1, last + RENDER_MARGIN);
+
+  for (let i = 0; i < pageBoxes.length; i++) {
+    const b = pageBoxes[i];
+    if (i >= lo && i <= hi) {
+      if (!b.ready && !b.task) renderPage(i);
+    } else if (b.canvas) {
+      if (b.task) { try { b.task.cancel(); } catch {} b.task = null; }
+      dropCanvas(b);
+      b.ready = false;
+      b.el.classList.remove('ready');
+    }
+  }
+
+  const nowCurrent = first + 1;
+  if (nowCurrent !== current) { current = nowCurrent; updateCounter(); moveThumb(); }
+}
+
+function dropCanvas(b) {
+  if (!b.canvas) return;
+  b.canvas.width = b.canvas.height = 0;   // release GPU/heap memory immediately
+  b.canvas.remove();
+  b.canvas = null;
+}
+
+async function renderPage(i) {
+  const b = pageBoxes[i];
+  if (!b || b.task || b.ready) return;
+  const n = i + 1;
+  let page;
+  try { page = await doc.getPage(n); } catch { return; }
+
+  const scale = fitScale * zoom;
+  const vp1 = page.getViewport({ scale: 1 });
+
+  // Correct the placeholder if this page differs from page 1 (mixed-size documents).
+  if (Math.abs(vp1.width - b.w0) > 0.5 || Math.abs(vp1.height - b.h0) > 0.5) {
+    b.w0 = vp1.width; b.h0 = vp1.height;
+    b.el.style.width  = Math.round(b.w0 * scale) + 'px';
+    b.el.style.height = Math.round(b.h0 * scale) + 'px';
+  }
+
+  const vp = page.getViewport({ scale });
+
+  // Phones will hand back a blank canvas rather than throw if we ask for too much,
+  // so trade sharpness for a canvas that actually paints.
+  let dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+  while (vp.width * dpr * vp.height * dpr > MAX_CANVAS_PIXELS && dpr > 0.4) dpr *= 0.8;
+
+  const canvas = document.createElement('canvas');
+  canvas.width  = Math.max(1, Math.floor(vp.width  * dpr));
+  canvas.height = Math.max(1, Math.floor(vp.height * dpr));
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  const task = page.render({
+    canvasContext: ctx,
+    viewport: vp,
+    transform: dpr === 1 ? null : [dpr, 0, 0, dpr, 0, 0],
+    background: '#FFFFFF',
+  });
+  b.task = task;
+
+  try {
+    await task.promise;
+    if (b.task !== task) return;              // superseded by a newer render
+    dropCanvas(b);
+    b.el.appendChild(canvas);
+    b.canvas = canvas;
+    b.ready = true;
+    b.el.classList.add('ready');
+  } catch (err) {
+    if (err?.name !== 'RenderingCancelledException') console.error(err);
+  } finally {
+    if (b.task === task) b.task = null;
+  }
+}
+
+/* ── Page rail ───────────────────────────────────────────────── */
+function buildRail() {
+  rail.querySelectorAll('.tick').forEach(t => t.remove());
+  const n = doc.numPages;
+  if (n <= 1) return;
+  const step = n <= 60 ? 1 : Math.ceil(n / 60);
+  const frag = document.createDocumentFragment();
+  for (let p = 1; p <= n; p += step) {
+    const tick = document.createElement('div');
+    tick.className = 'tick';
+    tick.style.top = ((p - 1) / (n - 1) * 100) + '%';
+    frag.appendChild(tick);
+  }
+  rail.insertBefore(frag, rail.firstChild);
+  moveThumb();
+}
+
+function moveThumb() {
+  if (!doc || doc.numPages < 2) return;
+  const f = (current - 1) / (doc.numPages - 1);
+  $('thumb').style.top = (f * 100) + '%';
+  $('flag').style.top  = (f * 100) + '%';
+}
+
+function scrollToPage(n, smooth) {
+  const b = pageBoxes[clamp(n, 1, pageBoxes.length) - 1];
+  if (!b) return;
+  well.scrollTo({ top: b.el.offsetTop - topInset(), behavior: smooth ? 'smooth' : 'auto' });
+}
+
+rail.addEventListener('pointerdown', e => {
+  if (!doc) return;
+  rail.setPointerCapture(e.pointerId);
+  rail.classList.add('scrubbing');
+  scrubTo(e);
+});
+rail.addEventListener('pointermove', e => { if (rail.classList.contains('scrubbing')) scrubTo(e); });
+['pointerup', 'pointercancel'].forEach(ev =>
+  rail.addEventListener(ev, () => rail.classList.remove('scrubbing')));
+
+function scrubTo(e) {
+  const r = rail.getBoundingClientRect();
+  const f = clamp((e.clientY - r.top) / r.height, 0, 1);
+  const n = Math.round(f * (doc.numPages - 1)) + 1;
+  $('flag').textContent = `${n} / ${doc.numPages}`;
+  $('thumb').style.top = (f * 100) + '%';
+  $('flag').style.top  = (f * 100) + '%';
+  if (n !== current) { current = n; updateCounter(); scrollToPage(n, false); }
+}
+
+function updateCounter() {
+  $('counter').textContent = doc ? `${current} / ${doc.numPages}` : '—';
+}
+
+/* ── Scroll & resize ─────────────────────────────────────────── */
+let scrollRaf = 0;
+well.addEventListener('scroll', () => {
+  if (scrollRaf) return;
+  scrollRaf = requestAnimationFrame(() => { scrollRaf = 0; renderVisible(); });
+}, { passive: true });
+
+let resizeTimer;
+addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (!doc) return;
+    const keep = current;
+    layout(true);
+    scrollToPage(keep, false);
+  }, 180);
+});
+
+/* ── Pinch to zoom ───────────────────────────────────────────── */
+let pinch = null;
+const touchDist = t => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+
+well.addEventListener('touchstart', e => {
+  if (!doc || e.touches.length !== 2) return;
+  const t = [e.touches[0], e.touches[1]];
+  const midY = (t[0].clientY + t[1].clientY) / 2;
+  const midX = (t[0].clientX + t[1].clientX) / 2;
+  pinch = {
+    d0: touchDist(t), z0: zoom, k: 1, midY,
+    originY: midY + well.scrollTop,
+    originX: midX + well.scrollLeft,
+  };
+  pagesEl.style.transformOrigin = `${pinch.originX}px ${pinch.originY}px`;
+}, { passive: true });
+
+well.addEventListener('touchmove', e => {
+  if (!pinch || e.touches.length !== 2) return;
+  e.preventDefault();
+  const k = touchDist([e.touches[0], e.touches[1]]) / pinch.d0;
+  pinch.k = clamp(k, MIN_ZOOM / pinch.z0, MAX_ZOOM / pinch.z0);
+  pagesEl.style.transform = `scale(${pinch.k})`;
+}, { passive: false });
+
+function endPinch() {
+  if (!pinch) return;
+  const p = pinch; pinch = null;
+  pagesEl.style.transform = '';
+  pagesEl.style.transformOrigin = '';
+  const target = clamp(p.z0 * p.k, MIN_ZOOM, MAX_ZOOM);
+  const applied = target / p.z0;
+  const nextTop = p.originY * applied - p.midY;
+  setZoom(target, () => { well.scrollTop = nextTop; });
+}
+well.addEventListener('touchend', e => { if (pinch && e.touches.length < 2) endPinch(); });
+well.addEventListener('touchcancel', endPinch);
+
+/* ── Tap to hide chrome, double-tap to zoom ──────────────────── */
+let tapStart = null, lastTap = 0;
+well.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  tapStart = { x: e.clientX, y: e.clientY, t: Date.now(), top: well.scrollTop };
+});
+well.addEventListener('pointerup', e => {
+  if (!tapStart || !doc || pinch) { tapStart = null; return; }
+  const moved = Math.hypot(e.clientX - tapStart.x, e.clientY - tapStart.y);
+  const scrolled = Math.abs(well.scrollTop - tapStart.top);
+  const quick = Date.now() - tapStart.t < 400;
+  tapStart = null;
+  if (moved > 12 || scrolled > 6 || !quick) return;
+
+  const now = Date.now();
+  if (now - lastTap < 300) {           // double tap
+    lastTap = 0;
+    setZoom(zoom > 1.05 ? 1 : 2);
+    return;
+  }
+  lastTap = now;
+  setTimeout(() => {
+    if (lastTap && Date.now() - lastTap >= 290) {
+      document.body.classList.toggle('immersive');
+      closePanels();
+    }
+  }, 300);
+});
+
+/* ── Search ──────────────────────────────────────────────────── */
+async function runSearch(query) {
+  const token = ++searchToken;
+  hits = []; hitIndex = -1;
+  const q = query.trim().toLowerCase();
+  if (!q || !doc) { $('hits').textContent = ''; return; }
+
+  $('hits').textContent = '…';
+  for (let n = 1; n <= doc.numPages; n++) {
+    if (token !== searchToken) return;
+    let text = textCache.get(n);
+    if (text === undefined) {
+      try {
+        const page = await doc.getPage(n);
+        const tc = await page.getTextContent();
+        text = tc.items.map(i => i.str).join(' ').toLowerCase();
+      } catch { text = ''; }
+      textCache.set(n, text);
+    }
+    if (text.includes(q)) {
+      hits.push(n);
+      if (hits.length === 1) { hitIndex = 0; goToHit(0); }
+      $('hits').textContent = `${hits.length} page${hits.length === 1 ? '' : 's'}`;
+    }
+  }
+  if (token !== searchToken) return;
+  $('hits').textContent = hits.length
+    ? `${hitIndex + 1} of ${hits.length}`
+    : 'No matches';
+}
+
+function goToHit(i) {
+  if (!hits.length) return;
+  hitIndex = (i + hits.length) % hits.length;
+  const n = hits[hitIndex];
+  current = n; updateCounter(); moveThumb();
+  scrollToPage(n, true);
+  $('hits').textContent = `${hitIndex + 1} of ${hits.length}`;
+}
+
+let searchTimer;
+$('searchInput').addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  const v = e.target.value;
+  searchTimer = setTimeout(() => runSearch(v), 280);
+});
+$('searchInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); goToHit(hitIndex + 1); }
+});
+$('hitNext').onclick = () => goToHit(hitIndex + 1);
+$('hitPrev').onclick = () => goToHit(hitIndex - 1);
+
+/* ── Panels ──────────────────────────────────────────────────── */
+function closePanels() {
+  $('searchPanel').classList.remove('open');
+  $('jumpPanel').classList.remove('open');
+  $('searchBtn').setAttribute('aria-pressed', 'false');
+}
+function togglePanel(panel, input) {
+  const open = panel.classList.contains('open');
+  closePanels();
+  if (!open) { panel.classList.add('open'); input.focus(); input.select?.(); }
+}
+
+$('searchBtn').onclick = () => {
+  if (!doc) return status('Open a PDF first.');
+  const opening = !$('searchPanel').classList.contains('open');
+  togglePanel($('searchPanel'), $('searchInput'));
+  $('searchBtn').setAttribute('aria-pressed', String(opening));
+  document.body.classList.remove('immersive');
+};
+$('counter').onclick = () => {
+  if (!doc) return;
+  togglePanel($('jumpPanel'), $('jumpInput'));
+  document.body.classList.remove('immersive');
+};
+function doJump() {
+  const n = parseInt($('jumpInput').value, 10);
+  if (!n || n < 1 || n > doc.numPages) return status(`Enter a page between 1 and ${doc.numPages}.`, true);
+  current = n; updateCounter(); moveThumb();
+  scrollToPage(n, true);
+  closePanels();
+  $('jumpInput').blur();
+}
+$('jumpGo').onclick = doJump;
+$('jumpInput').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doJump(); } });
+
+/* ── Toolbar ─────────────────────────────────────────────────── */
+const MODES = ['day', 'sepia', 'night'];
+const THEME_COLOR = { day: '#F2F3F0', sepia: '#EFE7DA', night: '#1B1F22' };
+let modeIndex = 0;
+$('modeBtn').onclick = () => {
+  modeIndex = (modeIndex + 1) % MODES.length;
+  const m = MODES[modeIndex];
+  document.body.dataset.mode = m;
+  document.querySelector('meta[name="theme-color"]').content = THEME_COLOR[m];
+  status(m === 'day' ? 'Day' : m === 'sepia' ? 'Sepia' : 'Night', false, 900);
+};
+
+$('zoomIn').onclick  = () => setZoom(zoom * 1.25);
+$('zoomOut').onclick = () => setZoom(zoom / 1.25);
+$('fitBtn').onclick  = () => { setZoom(1); status('Fit to width', false, 900); };
+
+$('openBtn').onclick   = () => $('fileInput').click();
+$('emptyOpen').onclick = () => $('fileInput').click();
+$('fileInput').addEventListener('change', e => {
+  const f = e.target.files?.[0];
+  e.target.value = '';
+  openFile(f);
+});
+
+addEventListener('keydown', e => {
+  if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if (!doc) return;
+  if (e.key === 'ArrowRight' || e.key === 'PageDown') { e.preventDefault(); scrollToPage(current + 1, true); }
+  if (e.key === 'ArrowLeft'  || e.key === 'PageUp')   { e.preventDefault(); scrollToPage(current - 1, true); }
+  if (e.key === 'Home') { e.preventDefault(); scrollToPage(1, true); }
+  if (e.key === 'End')  { e.preventDefault(); scrollToPage(doc.numPages, true); }
+  if (e.key === '+' || e.key === '=') setZoom(zoom * 1.25);
+  if (e.key === '-') setZoom(zoom / 1.25);
+  if (e.key === '0') setZoom(1);
+  if (e.key === 'Escape') closePanels();
+});
+
+/* Drag and drop, for desktop testing */
+addEventListener('dragover', e => e.preventDefault());
+addEventListener('drop', e => {
+  e.preventDefault();
+  const f = [...(e.dataTransfer?.files || [])].find(f => f.type === 'application/pdf');
+  if (f) openFile(f);
+});
+
+/* ── Share target pickup ─────────────────────────────────────── */
+async function checkShared() {
+  const params = new URLSearchParams(location.search);
+  if (!params.has('shared')) return;
+  history.replaceState(null, '', location.pathname);
+  try {
+    const cache = await caches.open('leaf-share');
+    const res = await cache.match('shared-file');
+    if (!res) return;
+    const name = decodeURIComponent(res.headers.get('x-filename') || 'Shared.pdf');
+    const buf = await res.arrayBuffer();
+    await cache.delete('shared-file');
+    await openBuffer(buf, name);
+  } catch (err) {
+    console.error(err);
+    status('Could not open the shared file.', true);
+  }
+}
+
+/* ── File handler launch (desktop Chrome/Edge; ignored on Android) ── */
+if ('launchQueue' in window) {
+  window.launchQueue.setConsumer(async params => {
+    const handle = params?.files?.[0];
+    if (!handle) return;
+    try { await openFile(await handle.getFile()); }
+    catch { status('Could not open that file.', true); }
+  });
+}
+
+/* ── Service worker (offline + share target) ─────────────────── */
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  navigator.serviceWorker.register('sw.js').catch(() => { /* fine — app still works online */ });
+}
+
+checkShared();
+</script>
+</body>
+</html>
