@@ -361,6 +361,52 @@
   }
   .linkLayer a:active { background: rgba(31, 120, 180, .22); }
 
+  /* ── Document info ────────────────────────────────────────────── */
+  #docinfo {
+    position: fixed; inset: 0; z-index: 40;
+    display: none; flex-direction: column;
+    background: var(--housing); color: var(--ink);
+  }
+  #docinfo.open { display: flex; }
+  .info-body { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 4px 0 24px; }
+
+  .info-section {
+    padding: 16px 16px 6px;
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--ink-soft); font-weight: 600;
+  }
+  .info-field { padding: 7px 16px; }
+  .info-field label {
+    display: block; margin-bottom: 5px;
+    font-size: 12px; color: var(--ink-soft);
+  }
+  .info-field input {
+    width: 100%; font: inherit; font-size: 14px;
+    color: var(--ink); background: var(--field);
+    border: 1px solid var(--rule); border-radius: 6px;
+    padding: 9px 11px;
+  }
+  .info-field input:focus { outline: none; border-color: var(--accent); }
+  .info-field input:disabled { opacity: .55; }
+
+  .info-row {
+    display: flex; gap: 12px; align-items: baseline;
+    padding: 7px 16px;
+  }
+  .info-row dt { flex: none; width: 116px; font-size: 12px; color: var(--ink-soft); }
+  .info-row dd {
+    flex: 1; min-width: 0; margin: 0; font-size: 13px;
+    overflow-wrap: anywhere;
+  }
+  .info-row dd.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  .info-note {
+    margin: 14px 16px; padding: 13px 15px;
+    border: 1px solid var(--signal); border-radius: 8px;
+    font-size: 13px; line-height: 1.5;
+  }
+  .info-note strong { display: block; margin-bottom: 3px; }
+
   /* ── Outline pane ────────────────────────────────────────────── */
   #outlineBtn { display: none; }
   body.has-outline #outlineBtn { display: grid; }
@@ -431,6 +477,9 @@
   </button>
   <button class="btn" id="libBtn" title="Library" aria-label="Library">
     <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>
+  </button>
+  <button class="btn" id="infoBtn" title="Document info" aria-label="Document info">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5.5"/><circle cx="12" cy="7.9" r=".9" fill="currentColor" stroke="none"/></svg>
   </button>
   <button class="btn" id="outlineBtn" title="Contents" aria-label="Contents">
     <svg viewBox="0 0 24 24"><path d="M5 6h2M5 12h2M5 18h2M10 6h9M10 12h9M10 18h9"/></svg>
@@ -512,6 +561,22 @@
     <svg viewBox="0 0 24 24"><path d="M8 9L5 12l3 3M16 9l3 3-3 3M5 12h14"/></svg>
   </button>
 </footer>
+
+<div id="docinfo">
+  <header class="lib-head">
+    <div>
+      <h2>Document info</h2>
+      <span class="lib-usage" id="infoSub"></span>
+    </div>
+    <button class="btn" id="infoClose" aria-label="Close document info">
+      <svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg>
+    </button>
+  </header>
+  <div class="info-body" id="infoBody"></div>
+  <footer class="lib-foot" id="infoFoot" hidden>
+    <button class="cta" id="infoSave">Save changes</button>
+  </footer>
+</div>
 
 <div id="outline">
   <header class="lib-head">
@@ -784,7 +849,8 @@ async function openBuffer(buffer, name, opts = {}) {
   textCache.clear(); hits = []; hitIndex = -1;
   activeQuery = ''; outline = null; destCache.clear();
   document.body.classList.remove('has-outline');
-  closeOutline();
+  closeOutline(); closeDocInfo();
+  docInfo = null; infoDirty = false;
   $('hits').textContent = ''; $('searchInput').value = '';
   $('jumpInput').max = doc.numPages;
 
@@ -1614,6 +1680,259 @@ function closeOutline() { $('outline').classList.remove('open'); }
 $('outlineBtn').onclick = openOutline;
 $('outlineClose').onclick = closeOutline;
 
+/* ── Document info ───────────────────────────────────────────────
+   Viewing is pdf.js. Editing is not: pdf.js is a reader and cannot
+   write PDFs at all, so saving pulls in pdf-lib, which re-serialises
+   the file. Two consequences drive the design here:
+
+   - An encrypted PDF must be refused. pdf-lib's ignoreEncryption does
+     not decrypt; it copies still-encrypted streams into a file with no
+     encryption dictionary, and the result does not open in any reader.
+   - The original bytes are needed to save, and pdf.js has already
+     detached the buffer it was given. They come back from the library
+     copy in IndexedDB, so a document that was never saved cannot be
+     edited.
+   ─────────────────────────────────────────────────────────────── */
+
+const PDFLIB_SOURCES = [
+  'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.esm.min.js',
+  'https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.esm.min.js',
+];
+const EDITABLE = ['Title', 'Author', 'Subject', 'Keywords', 'Creator', 'Producer'];
+
+let pdfLib = null;
+let docInfo = null;      // { info, metadata } from pdf.js
+let infoDirty = false;
+
+async function loadPdfLib() {
+  if (pdfLib) return pdfLib;
+  let lastErr;
+  for (const url of PDFLIB_SOURCES) {
+    try { pdfLib = await import(/* @vite-ignore */ url); return pdfLib; }
+    catch (err) { lastErr = err; }
+  }
+  throw lastErr ?? new Error('PDF writer unavailable');
+}
+
+/* "D:20260102030405+01'00'" -> a readable local date. */
+function pdfDate(raw) {
+  if (!raw) return null;
+  const m = /^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?/.exec(String(raw));
+  if (!m) return String(raw);
+  const [, y, mo, d, hh, mm, ss] = m;
+  const dt = new Date(Date.UTC(+y, (+mo || 1) - 1, +d || 1, +hh || 0, +mm || 0, +ss || 0));
+  if (isNaN(dt)) return String(raw);
+  return dt.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+}
+
+function isEncrypted() {
+  return !!docInfo?.info?.EncryptFilterName;
+}
+
+function row(dt, dd, mono) {
+  if (dd === undefined || dd === null || dd === '') return null;
+  const el = document.createElement('div');
+  el.className = 'info-row';
+  const k = document.createElement('dt'); k.textContent = dt;
+  const v = document.createElement('dd'); v.textContent = String(dd);
+  if (mono) v.className = 'mono';
+  el.append(k, v);
+  return el;
+}
+
+function section(title) {
+  const el = document.createElement('div');
+  el.className = 'info-section';
+  el.textContent = title;
+  return el;
+}
+
+function note(title, body) {
+  const el = document.createElement('div');
+  el.className = 'info-note';
+  const b = document.createElement('strong'); b.textContent = title;
+  el.append(b, document.createTextNode(body));
+  return el;
+}
+
+async function renderDocInfo() {
+  const body = $('infoBody');
+  body.replaceChildren();
+  $('infoFoot').hidden = true;
+  if (!doc) return;
+
+  try { docInfo = await doc.getMetadata(); }
+  catch { docInfo = { info: {}, metadata: null }; }
+  const info = docInfo.info || {};
+
+  const rec = currentId ? await dbGet('docs', currentId).catch(() => null) : null;
+  const canEdit = !!currentId && !isEncrypted();
+
+  $('infoSub').textContent = `${doc.numPages} page${doc.numPages === 1 ? '' : 's'}`;
+
+  // ── Editable fields ──
+  body.appendChild(section('Metadata'));
+  for (const key of EDITABLE) {
+    const field = document.createElement('div');
+    field.className = 'info-field';
+    const label = document.createElement('label');
+    label.textContent = key;
+    label.setAttribute('for', `meta-${key}`);
+    const input = document.createElement('input');
+    input.id = `meta-${key}`;
+    input.type = 'text';
+    input.value = info[key] ?? '';
+    input.dataset.key = key;
+    input.disabled = !canEdit;
+    input.addEventListener('input', () => { infoDirty = true; });
+    field.append(label, input);
+    body.appendChild(field);
+  }
+
+  if (canEdit) {
+    $('infoFoot').hidden = false;
+  } else if (isEncrypted()) {
+    body.appendChild(note('This PDF is encrypted — metadata is read-only.',
+      'Rewriting an encrypted file would leave its contents scrambled and the ' +
+      'document unopenable, so editing is disabled rather than risking your file.'));
+  } else {
+    body.appendChild(note('Not in your library — metadata is read-only.',
+      'Saving needs the original file bytes, which are kept in the library. ' +
+      'This document was opened without being saved, so there is nothing to rewrite.'));
+  }
+
+  // ── Read-only facts ──
+  body.appendChild(section('Document'));
+  const facts = [
+    row('Pages', doc.numPages, true),
+    row('File size', rec?.size ? fmtSize(rec.size) : null, true),
+    row('PDF version', info.PDFFormatVersion, true),
+    row('Created', pdfDate(info.CreationDate)),
+    row('Modified', pdfDate(info.ModDate)),
+    row('Language', info.Language),
+    row('Encryption', info.EncryptFilterName ?? 'None'),
+    row('Linearized', info.IsLinearized ? 'Yes' : 'No'),
+    row('Forms', info.IsAcroFormPresent ? (info.IsXFAPresent ? 'AcroForm + XFA' : 'AcroForm') : 'None'),
+    row('Signatures', info.IsSignaturesPresent ? 'Present' : 'None'),
+    row('XMP metadata', docInfo.metadata ? 'Present' : 'None'),
+  ].filter(Boolean);
+  for (const f of facts) body.appendChild(f);
+
+  if (info.IsSignaturesPresent && canEdit) {
+    body.appendChild(note('This PDF is digitally signed.',
+      'Saving rewrites the file, which will invalidate the signature. The original ' +
+      'stays in your library until you choose to replace it.'));
+  }
+  if (docInfo.metadata && canEdit) {
+    body.appendChild(note('This PDF also carries XMP metadata.',
+      'Some readers prefer XMP over the fields above, so they may keep showing the ' +
+      'old title after you save. Only the standard fields are edited here.'));
+  }
+  infoDirty = false;
+}
+
+async function saveDocInfo() {
+  if (!currentId || isEncrypted()) return;
+
+  const changes = {};
+  for (const key of EDITABLE) {
+    const el = document.getElementById(`meta-${key}`);
+    if (el) changes[key] = el.value;
+  }
+
+  status('Saving…', false, 0);
+  let lib;
+  try { lib = await loadPdfLib(); }
+  catch { return status('Could not load the PDF writer. Check your connection.', true, 5000); }
+
+  let bytes;
+  try {
+    const file = await dbGet('files', currentId);
+    if (!file?.blob) throw new Error('missing');
+    bytes = new Uint8Array(await file.blob.arrayBuffer());
+  } catch {
+    return status('The original file is no longer in your library.', true, 5000);
+  }
+
+  let out;
+  try {
+    const pdf = await lib.PDFDocument.load(bytes, { updateMetadata: false });
+    pdf.setTitle(changes.Title || '');
+    pdf.setAuthor(changes.Author || '');
+    pdf.setSubject(changes.Subject || '');
+    pdf.setKeywords(changes.Keywords ? changes.Keywords.split(/[,;]\s*/).filter(Boolean) : []);
+    pdf.setCreator(changes.Creator || '');
+    pdf.setProducer(changes.Producer || '');
+    pdf.setModificationDate(new Date());
+    out = await pdf.save();
+  } catch (err) {
+    console.error(err);
+    return status('That PDF could not be rewritten. It has been left untouched.', true, 5000);
+  }
+
+  // Verify before replacing anything. A file that no longer opens is far worse
+  // than a title that did not change.
+  try {
+    const check = await pdfjsLib.getDocument({ data: out.slice(), isEvalSupported: true }).promise;
+    if (check.numPages !== doc.numPages) throw new Error('page count changed');
+    await check.destroy();
+  } catch (err) {
+    console.error(err);
+    return status('The rewritten file failed its check, so nothing was changed.', true, 6000);
+  }
+
+  const name = $('title').textContent;
+  offerDownload(out, name);
+
+  // Re-key under the new content hash and carry the reading position over.
+  try {
+    const oldId = currentId;
+    const rec = await dbGet('docs', oldId).catch(() => null);
+    const buf = out.buffer.slice(0);
+    const newId = await hashBuffer(buf, name);
+    await dbPut('files', { id: newId, blob: new Blob([buf], { type: 'application/pdf' }) });
+    await dbPut('docs', {
+      ...(rec || {}), id: newId, name, size: buf.byteLength,
+      pageCount: doc.numPages, openedAt: Date.now(),
+    });
+    if (newId !== oldId) { await dbDelete('files', oldId); await dbDelete('docs', oldId); }
+    currentId = newId;
+  } catch (err) {
+    console.warn('Library update failed:', err);
+    status('Saved and downloaded, but the library copy could not be updated.', true, 5000);
+    return;
+  }
+
+  infoDirty = false;
+  status('Metadata saved. The edited file has also been downloaded.', false, 4000);
+  renderDocInfo();
+}
+
+function offerDownload(bytes, name) {
+  try {
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = /\.pdf$/i.test(name) ? name : `${name}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  } catch (err) { console.warn('Download failed:', err); }
+}
+
+function openDocInfo() {
+  if (!doc) return status('Open a PDF first.');
+  closePanels(); closeLibrary(); closeOutline();
+  $('docinfo').classList.add('open');
+  renderDocInfo();
+}
+function closeDocInfo() { $('docinfo').classList.remove('open'); }
+
+$('infoBtn').onclick = openDocInfo;
+$('infoClose').onclick = closeDocInfo;
+$('infoSave').onclick = saveDocInfo;
+
 /* ── Page rail ───────────────────────────────────────────────── */
 function buildRail() {
   rail.querySelectorAll('.tick').forEach(t => t.remove());
@@ -1962,6 +2281,10 @@ $('fileInput').addEventListener('change', e => {
 
 addEventListener('keydown', e => {
   if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+  if ($('docinfo').classList.contains('open')) {
+    if (e.key === 'Escape') { e.preventDefault(); closeDocInfo(); }
+    return;
+  }
   if ($('outline').classList.contains('open')) {
     if (e.key === 'Escape') { e.preventDefault(); closeOutline(); }
     return;                                  // don't drive the document underneath
@@ -2186,6 +2509,7 @@ async function openFromLibrary(id) {
 function openLibrary() {
   closePanels();
   closeOutline();
+  closeDocInfo();
   $('library').classList.add('open');
   renderLibrary();
 }
