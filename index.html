@@ -303,6 +303,11 @@
     padding: 40px 24px; text-align: center;
     font-size: 14px; line-height: 1.5; color: var(--ink-soft);
   }
+  .lib-note {
+    margin: 24px 16px; padding: 16px 18px; text-align: left;
+    border: 1px solid var(--signal); border-radius: 8px;
+    color: var(--ink);
+  }
 
   /* ── Status line ─────────────────────────────────────────────── */
   #status {
@@ -556,6 +561,18 @@ async function hashBuffer(buffer, name) {
   }
 }
 
+/* Sandboxed iframes and private browsing both throw on indexedDB.open().
+   Failing silently there makes the library look broken rather than unavailable,
+   so probe once and say so. */
+let storageOk = null;
+async function probeStorage() {
+  if (storageOk !== null) return storageOk;
+  try { await db(); storageOk = true; }
+  catch (err) { console.warn('Storage unavailable:', err); storageOk = false; }
+  return storageOk;
+}
+let warnedNoStorage = false;
+
 let persistRequested = false;
 async function requestPersistence() {
   if (persistRequested) return;
@@ -670,6 +687,11 @@ async function openBuffer(buffer, name, opts = {}) {
   clearStatus();
 
   if (resumePage > 1) status(`Resumed on page ${resumePage}`, false, 1800);
+
+  if (!id && !warnedNoStorage) {
+    warnedNoStorage = true;
+    status('Opened, but this browser is not saving it to the library.', false, 4000);
+  }
 
   if (id) {
     const updated = {
@@ -1272,7 +1294,15 @@ async function renderLibrary() {
   if (!recs.length) {
     const blank = document.createElement('div');
     blank.className = 'lib-blank';
-    blank.textContent = 'Documents you open are kept here, along with the page you reached.';
+    if (await probeStorage()) {
+      blank.textContent = 'Documents you open are kept here, along with the page you reached.';
+    } else {
+      blank.classList.add('lib-note');
+      blank.textContent =
+        'This browser context is not allowing storage — usually a sandboxed preview ' +
+        'or a private window. PDFs will still open, but nothing can be saved. ' +
+        'Served from GitHub Pages, the library works normally.';
+    }
     list.appendChild(blank);
   }
 
@@ -1371,6 +1401,7 @@ async function removeDoc(id) {
 
 async function updateUsage() {
   const el = $('libUsage');
+  if (!(await probeStorage())) { el.textContent = 'Storage unavailable'; return; }
   try {
     const recs = await libraryRecords();
     const bytes = recs.reduce((n, r) => n + (r.size || 0), 0);
