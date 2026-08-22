@@ -343,6 +343,16 @@
   }
   .textLayer mark.hl.on { background: rgba(255, 138, 0, .72); }
 
+  /* Diagnostic: reveal what was actually extracted and where it sits.
+     If the boxes are empty the PDF has no text; if they are offset from the
+     print, the layer is misaligned. Two very different problems. */
+  body[data-textdebug="on"] .textLayer span {
+    color: rgba(10, 90, 190, .8);
+    background: rgba(30, 130, 255, .12);
+    outline: 1px solid rgba(30, 130, 255, .4);
+  }
+  body[data-textdebug="on"] .page canvas { opacity: .35; }
+
   /* ── Link layer ──────────────────────────────────────────────── */
   .linkLayer { position: absolute; inset: 0; z-index: 2; }
   .linkLayer a {
@@ -463,6 +473,13 @@
       <button data-page="day">Day</button>
       <button data-page="sepia">Sepia</button>
       <button data-page="night">Night</button>
+    </div>
+  </div>
+  <div class="seg-row">
+    <span class="seg-label">Text layer</span>
+    <div class="seg" id="textSeg" role="group" aria-label="Text layer visibility">
+      <button data-text="off">Hidden</button>
+      <button data-text="on">Reveal</button>
     </div>
   </div>
   <div class="seg-row">
@@ -1768,10 +1785,12 @@ async function runSearch(query) {
   if (!q || !doc) { $('hits').textContent = ''; return; }
 
   $('hits').textContent = '…';
+  let textSeen = 0;
   for (let n = 1; n <= doc.numPages; n++) {
     if (token !== searchToken) return;
     const text = await pageText(n);
     if (token !== searchToken) return;
+    textSeen += text.length;
 
     const starts = findMatches(text, q);
     starts.forEach((at, ord) => hits.push({ page: n, ord, at }));
@@ -1780,7 +1799,16 @@ async function runSearch(query) {
     else if (starts.length) $('hits').textContent = `${hitIndex + 1} of ${hits.length}`;
   }
   if (token !== searchToken) return;
-  $('hits').textContent = hits.length ? `${hitIndex + 1} of ${hits.length}` : 'No matches';
+  if (hits.length) { $('hits').textContent = `${hitIndex + 1} of ${hits.length}`; return; }
+
+  // Distinguish "not in this document" from "this document has no text at all".
+  // A scan is just pictures of words; nothing can match until it is OCR'd.
+  if (textSeen === 0) {
+    $('hits').textContent = 'No text';
+    status('This PDF has no text layer — it is a scan. Searching needs OCR first.', true, 6000);
+  } else {
+    $('hits').textContent = 'No matches';
+  }
 }
 
 function goToHit(i) {
@@ -1810,6 +1838,16 @@ $('searchInput').addEventListener('keydown', e => {
 $('hitNext').onclick = () => goToHit(hitIndex + 1);
 $('hitPrev').onclick = () => goToHit(hitIndex - 1);
 
+/* A page of a scan yields no text items at all. Say so up front rather than
+   letting the user conclude that search is broken. */
+function warnIfPageHasNoText() {
+  const entry = live.get(current - 1);
+  if (!entry) return;
+  if (entry.norm && entry.norm.text.trim() === '') {
+    status('This page has no text layer — it looks like a scan.', true, 5000);
+  }
+}
+
 /* ── Panels ──────────────────────────────────────────────────── */
 function closePanels() {
   if ($('searchPanel').classList.contains('open') && activeQuery) {
@@ -1834,6 +1872,7 @@ $('searchBtn').onclick = () => {
   togglePanel($('searchPanel'), $('searchInput'));
   $('searchBtn').setAttribute('aria-pressed', String(opening));
   document.body.classList.remove('immersive');
+  if (opening) warnIfPageHasNoText();
 };
 $('counter').onclick = () => {
   if (!doc) return;
@@ -1860,17 +1899,22 @@ const darkMedia = matchMedia('(prefers-color-scheme: dark)');
 const THEME_COLOR = { light: '#F2F3F0', dark: '#1B1F22' };
 
 let pageTheme = 'day';
+let textDebug = 'off';
 let uiPref = 'auto';               // 'light' | 'dark' | 'auto'
 
 const resolvedUi = () => uiPref === 'auto' ? (darkMedia.matches ? 'dark' : 'light') : uiPref;
 
 function applyAppearance() {
   document.body.dataset.page = pageTheme;
+  document.body.dataset.textdebug = textDebug;
   document.body.dataset.ui = resolvedUi();
   document.querySelector('meta[name="theme-color"]').content = THEME_COLOR[resolvedUi()];
 
   for (const b of $('pageSeg').children) {
     b.setAttribute('aria-pressed', String(b.dataset.page === pageTheme));
+  }
+  for (const b of $('textSeg').children) {
+    b.setAttribute('aria-pressed', String(b.dataset.text === textDebug));
   }
   for (const b of $('uiSeg').children) {
     b.setAttribute('aria-pressed', String(b.dataset.ui === uiPref));
@@ -1880,6 +1924,13 @@ function applyAppearance() {
 $('pageSeg').addEventListener('click', e => {
   const b = e.target.closest('button');
   if (b) { pageTheme = b.dataset.page; applyAppearance(); }
+});
+$('textSeg').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  textDebug = b.dataset.text;
+  applyAppearance();
+  if (textDebug === 'on') status('Blue boxes are the extracted text.', false, 3200);
 });
 $('uiSeg').addEventListener('click', e => {
   const b = e.target.closest('button');
