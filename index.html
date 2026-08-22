@@ -124,13 +124,18 @@
   }
   #well::-webkit-scrollbar { display: none; }
 
-  #pages { display: flex; flex-direction: column; align-items: center; gap: 10px;
-           will-change: transform; }
+  /* Sized and positioned from JS. Width tracks the widest page so that a
+     zoomed-in page can be scrolled to on both sides — centring an overflowing
+     box with flex or auto margins leaves the left edge unreachable.
+     No permanent will-change: this element can be hundreds of thousands of
+     pixels tall, and promoting it for the whole session is not free. */
+  #pages { position: relative; }
 
   .page {
-    position: relative; flex: none;
+    position: absolute;
     background: var(--paper);
     box-shadow: 0 1px 3px var(--shadow), 0 6px 16px -8px var(--shadow);
+    contain: layout paint;
   }
   body[data-page="night"] .page {
     box-shadow: 0 0 0 1px var(--rule), 0 2px 8px -2px var(--shadow);
@@ -459,6 +464,7 @@ const MIN_ZOOM = 0.35, MAX_ZOOM = 6;
 const RENDER_MARGIN = 1;      // pages kept rendered on each side of the viewport
 const MAX_DPR = 2;            // cap device pixel ratio — phones run out of canvas memory fast
 const MAX_CANVAS_PIXELS = 12e6;  // ~48 MB per page at 4 bytes/px
+const RAIL_W = 26;               // reserved for the scrubber
 const THUMB_W = 44;              // CSS px; rendered at 2x for the library list
 
 const $ = id => document.getElementById(id);
@@ -466,7 +472,6 @@ const well = $('well'), pagesEl = $('pages'), rail = $('rail');
 
 let pdfjsLib = null;
 let doc = null;
-let pageBoxes = [];           // { el, canvas, task, w0, h0, ready }
 let baseW = 612, baseH = 792; // page-1 dimensions at scale 1, used for placeholders
 let fitScale = 1, zoom = 1, current = 1;
 let currentId = null;         // library id of the open document, null if unsaved
@@ -677,7 +682,7 @@ async function openBuffer(buffer, name, opts = {}) {
   baseW = vp.width; baseH = vp.height;
 
   const resumePage = clamp(rec?.page || 1, 1, doc.numPages);
-  buildPages();
+  resetDocument();
   zoom = clamp(rec?.zoom || 1, MIN_ZOOM, MAX_ZOOM);
   layout(true);
   current = resumePage;
@@ -753,49 +758,145 @@ async function savePosition() {
 addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') savePosition(); });
 addEventListener('pagehide', savePosition);
 
-function buildPages() {
-  cancelAll();
-  pagesEl.replaceChildren();
-  pageBoxes = [];
-  const frag = document.createDocumentFragment();
-  for (let n = 1; n <= doc.numPages; n++) {
-    const el = document.createElement('div');
-    el.className = 'page';
-    el.dataset.n = n;
-    frag.appendChild(el);
-    pageBoxes.push({ el, canvas: null, task: null, w0: baseW, h0: baseH, ready: false });
+/* ── Geometry ────────────────────────────────────────────────────
+   Page positions are computed arithmetically, never measured. Reading
+   offsetTop in a scroll handler forces a synchronous layout, and doing
+   it once per page per frame is what makes long documents crawl.
+   ─────────────────────────────────────────────────────────────── */
+const PAGE_GAP = 10;
+
+let pageMeta = [];            // { w0, h0 } intrinsic size of every page
+let geom = { tops: [], heights: [], widths: [], total: 0, pagesW: 0, scale: 1 };
+let live = new Map();         // index -> { el, canvas, task, scale } for mounted pages
+let insets = { top: 0, left: 0, right: 0, width: 0 };
+
+function measureInsets() {
+  const cs = getComputedStyle(well);
+  insets = {
+    top:   parseFloat(cs.paddingTop)  || 0,
+    left:  parseFloat(cs.paddingLeft) || 0,
+    right: parseFloat(cs.paddingRight) || 0,
+    width: well.clientWidth,
+  };
+}
+
+function contentWidth() {
+  return insets.width - insets.left - insets.right - RAIL_W;
+}
+
+function computeGeometry() {
+  const scale = fitScale * zoom;
+  const n = pageMeta.length;
+  const tops = new Float64Array(n), heights = new Float64Array(n), widths = new Float64Array(n);
+  let y = 0, maxW = 0;
+  for (let i = 0; i < n; i++) {
+    const w = Math.round(pageMeta[i].w0 * scale);
+    const h = Math.round(pageMeta[i].h0 * scale);
+    widths[i] = w; heights[i] = h; tops[i] = y;
+    y += h + PAGE_GAP;
+    if (w > maxW) maxW = w;
   }
-  pagesEl.appendChild(frag);
-  observeAll();
+  geom = {
+    tops, heights, widths, scale,
+    total: Math.max(0, y - PAGE_GAP),
+    // As wide as the widest page, so a zoomed page can scroll to BOTH edges.
+    // Centring an overflowing box with flex or auto margins makes the left
+    // side unreachable.
+    pagesW: Math.max(maxW, contentWidth()),
+  };
+}
+
+/* Smallest index whose bottom edge is still below the fold. */
+function firstVisible(y) {
+  const { tops, heights } = geom;
+  let lo = 0, hi = tops.length - 1, ans = tops.length - 1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (tops[m] + heights[m] > y) { ans = m; hi = m - 1; } else lo = m + 1;
+  }
+  return ans;
+}
+
+function visibleRange() {
+  const n = pageMeta.length;
+  if (!n) return [0, -1];
+  const y = well.scrollTop;
+  const viewBottom = y + well.clientHeight - insets.top;
+  const first = firstVisible(y);
+  let last = first;
+  while (last + 1 < n && geom.tops[last + 1] < viewBottom) last++;
+  return [first, last];
+}
+
+/* ── Mounting ────────────────────────────────────────────────────
+   Only pages in the render window exist in the DOM. A thousand-page
+   document holds about five elements, so zoom and resize touch five
+   nodes rather than a thousand.
+   ─────────────────────────────────────────────────────────────── */
+function placeEl(i, entry) {
+  const el = entry.el;
+  el.style.top    = geom.tops[i] + 'px';
+  el.style.left   = Math.max(0, (geom.pagesW - geom.widths[i]) / 2) + 'px';
+  el.style.width  = geom.widths[i] + 'px';
+  el.style.height = geom.heights[i] + 'px';
+}
+
+function mount(i) {
+  let entry = live.get(i);
+  if (entry) return entry;
+  const el = document.createElement('div');
+  el.className = 'page';
+  el.dataset.n = i + 1;
+  entry = { el, canvas: null, task: null, scale: 0 };
+  live.set(i, entry);
+  placeEl(i, entry);
+  pagesEl.appendChild(el);
+  return entry;
+}
+
+function unmount(i) {
+  const entry = live.get(i);
+  if (!entry) return;
+  if (entry.task) { try { entry.task.cancel(); } catch {} entry.task = null; }
+  dropCanvas(entry);
+  entry.el.remove();
+  live.delete(i);
+}
+
+function dropCanvas(entry) {
+  if (!entry.canvas) return;
+  entry.canvas.width = entry.canvas.height = 0;   // release the memory now
+  entry.canvas.remove();
+  entry.canvas = null;
 }
 
 function cancelAll() {
-  for (const b of pageBoxes) {
-    if (b.task) { try { b.task.cancel(); } catch {} b.task = null; }
+  for (const entry of live.values()) {
+    if (entry.task) { try { entry.task.cancel(); } catch {} entry.task = null; }
   }
+}
+
+function resetDocument() {
+  for (const i of [...live.keys()]) unmount(i);
+  live.clear();
+  pagesEl.replaceChildren();
+  pageMeta = [];
+  for (let n = 0; n < doc.numPages; n++) pageMeta.push({ w0: baseW, h0: baseH });
 }
 
 /* ── Sizing ──────────────────────────────────────────────────── */
-function wellWidth() {
-  const cs = getComputedStyle(well);
-  return well.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - 26;
-}
-
-// The top bar floats over the well, so "the top of the readable area" is the padding edge.
-function topInset() {
-  return parseFloat(getComputedStyle(well).paddingTop) || 0;
-}
-
 function layout(recomputeFit) {
   if (!doc) return;
-  if (recomputeFit) fitScale = wellWidth() / baseW;
-  cancelAll();                 // anything mid-render is now at the wrong scale
-  const scale = fitScale * zoom;
-  for (const b of pageBoxes) {
-    b.el.style.width  = Math.round(b.w0 * scale) + 'px';
-    b.el.style.height = Math.round(b.h0 * scale) + 'px';
-    if (b.ready) { b.ready = false; b.el.classList.remove('ready'); dropCanvas(b); }
-  }
+  if (recomputeFit) { measureInsets(); fitScale = contentWidth() / baseW; }
+  computeGeometry();
+
+  pagesEl.style.width  = geom.pagesW + 'px';
+  pagesEl.style.height = geom.total + 'px';
+
+  // Reposition what is mounted. Existing canvases stay on screen, stretched by
+  // CSS, until a sharper one arrives — blanking them makes zoom feel broken.
+  for (const [i, entry] of live) placeEl(i, entry);
+
   $('zoomval').textContent = Math.round(zoom * 100) + '%';
   renderVisible();
 }
@@ -810,17 +911,6 @@ function setZoom(next, after) {
 }
 
 /* ── Rendering ───────────────────────────────────────────────── */
-let observer = null;
-function observeAll() {
-  observer?.disconnect();
-  observer = new IntersectionObserver(entries => {
-    let changed = false;
-    for (const e of entries) if (e.isIntersecting) changed = true;
-    if (changed) scheduleRender();
-  }, { root: well, rootMargin: '200% 0px' });
-  for (const b of pageBoxes) observer.observe(b.el);
-}
-
 let renderScheduled = false;
 function scheduleRender() {
   if (renderScheduled) return;
@@ -828,33 +918,23 @@ function scheduleRender() {
   requestAnimationFrame(() => { renderScheduled = false; renderVisible(); });
 }
 
-function visibleRange() {
-  const top = well.scrollTop + topInset(), bottom = well.scrollTop + well.clientHeight;
-  let first = pageBoxes.length, last = 0;
-  pageBoxes.forEach((b, i) => {
-    const t = b.el.offsetTop, h = b.el.offsetHeight;
-    if (t + h > top && t < bottom) { first = Math.min(first, i); last = Math.max(last, i); }
-  });
-  if (first > last) { first = last = clamp(current - 1, 0, pageBoxes.length - 1); }
-  return [first, last];
-}
-
 function renderVisible() {
-  if (!doc) return;
+  if (!doc || !pageMeta.length) return;
   const [first, last] = visibleRange();
   const lo = Math.max(0, first - RENDER_MARGIN);
-  const hi = Math.min(pageBoxes.length - 1, last + RENDER_MARGIN);
+  const hi = Math.min(pageMeta.length - 1, last + RENDER_MARGIN);
 
-  for (let i = 0; i < pageBoxes.length; i++) {
-    const b = pageBoxes[i];
-    if (i >= lo && i <= hi) {
-      if (!b.ready && !b.task) renderPage(i);
-    } else if (b.canvas) {
-      if (b.task) { try { b.task.cancel(); } catch {} b.task = null; }
-      dropCanvas(b);
-      b.ready = false;
-      b.el.classList.remove('ready');
-    }
+  // Unmount is proportional to what is mounted, not to document length.
+  for (const i of [...live.keys()]) if (i < lo || i > hi) unmount(i);
+
+  // The page being read is rendered before its neighbours.
+  const order = [first];
+  for (let i = lo; i <= hi; i++) if (i !== first) order.push(i);
+  for (const i of order) {
+    const entry = mount(i);
+    if (entry.task) continue;
+    if (entry.canvas && Math.abs(entry.scale - geom.scale) < 0.001) continue;
+    renderPage(i, entry);
   }
 
   const nowCurrent = first + 1;
@@ -866,30 +946,29 @@ function renderVisible() {
   }
 }
 
-function dropCanvas(b) {
-  if (!b.canvas) return;
-  b.canvas.width = b.canvas.height = 0;   // release GPU/heap memory immediately
-  b.canvas.remove();
-  b.canvas = null;
-}
-
-async function renderPage(i) {
-  const b = pageBoxes[i];
-  if (!b || b.task || b.ready) return;
+async function renderPage(i, entry) {
   const n = i + 1;
   let page;
   try { page = await doc.getPage(n); } catch { return; }
+  if (!live.has(i) || live.get(i) !== entry) return;   // scrolled away while waiting
 
-  const scale = fitScale * zoom;
   const vp1 = page.getViewport({ scale: 1 });
+  const meta = pageMeta[i];
 
-  // Correct the placeholder if this page differs from page 1 (mixed-size documents).
-  if (Math.abs(vp1.width - b.w0) > 0.5 || Math.abs(vp1.height - b.h0) > 0.5) {
-    b.w0 = vp1.width; b.h0 = vp1.height;
-    b.el.style.width  = Math.round(b.w0 * scale) + 'px';
-    b.el.style.height = Math.round(b.h0 * scale) + 'px';
+  // Mixed-size documents: correct this page and reflow the ones after it.
+  if (Math.abs(vp1.width - meta.w0) > 0.5 || Math.abs(vp1.height - meta.h0) > 0.5) {
+    meta.w0 = vp1.width; meta.h0 = vp1.height;
+    const anchorTop = geom.tops[current - 1];
+    const delta = well.scrollTop - anchorTop;
+    computeGeometry();
+    pagesEl.style.width  = geom.pagesW + 'px';
+    pagesEl.style.height = geom.total + 'px';
+    for (const [j, e] of live) placeEl(j, e);
+    // Keep the reader where they were rather than letting the page jump.
+    well.scrollTop = geom.tops[current - 1] + delta;
   }
 
+  const scale = geom.scale;
   const vp = page.getViewport({ scale });
 
   // Phones will hand back a blank canvas rather than throw if we ask for too much,
@@ -908,20 +987,21 @@ async function renderPage(i) {
     transform: dpr === 1 ? null : [dpr, 0, 0, dpr, 0, 0],
     background: '#FFFFFF',
   });
-  b.task = task;
+  entry.task = task;
 
   try {
     await task.promise;
-    if (b.task !== task) return;              // superseded by a newer render
-    dropCanvas(b);
-    b.el.appendChild(canvas);
-    b.canvas = canvas;
-    b.ready = true;
-    b.el.classList.add('ready');
+    if (entry.task !== task || live.get(i) !== entry) { canvas.width = canvas.height = 0; return; }
+    dropCanvas(entry);                 // swap only once the replacement is ready
+    entry.el.appendChild(canvas);
+    entry.canvas = canvas;
+    entry.scale = scale;
+    entry.el.classList.add('ready');
   } catch (err) {
+    canvas.width = canvas.height = 0;
     if (err?.name !== 'RenderingCancelledException') console.error(err);
   } finally {
-    if (b.task === task) b.task = null;
+    if (entry.task === task) entry.task = null;
   }
 }
 
@@ -950,9 +1030,9 @@ function moveThumb() {
 }
 
 function scrollToPage(n, smooth) {
-  const b = pageBoxes[clamp(n, 1, pageBoxes.length) - 1];
-  if (!b) return;
-  well.scrollTo({ top: b.el.offsetTop - topInset(), behavior: smooth ? 'smooth' : 'auto' });
+  const i = clamp(n, 1, pageMeta.length) - 1;
+  if (!geom.tops.length) return;
+  well.scrollTo({ top: geom.tops[i], behavior: smooth ? 'smooth' : 'auto' });
 }
 
 rail.addEventListener('pointerdown', e => {
@@ -1007,10 +1087,12 @@ well.addEventListener('touchstart', e => {
   const midY = (t[0].clientY + t[1].clientY) / 2;
   const midX = (t[0].clientX + t[1].clientX) / 2;
   pinch = {
-    d0: touchDist(t), z0: zoom, k: 1, midY,
-    originY: midY + well.scrollTop,
-    originX: midX + well.scrollLeft,
+    d0: touchDist(t), z0: zoom, k: 1, midY, midX,
+    // Offsets are relative to #pages, which starts at the well's padding edge.
+    originY: midY + well.scrollTop - insets.top,
+    originX: midX + well.scrollLeft - insets.left,
   };
+  pagesEl.style.willChange = 'transform';        // only for the duration of the gesture
   pagesEl.style.transformOrigin = `${pinch.originX}px ${pinch.originY}px`;
 }, { passive: true });
 
@@ -1027,10 +1109,15 @@ function endPinch() {
   const p = pinch; pinch = null;
   pagesEl.style.transform = '';
   pagesEl.style.transformOrigin = '';
+  pagesEl.style.willChange = '';
   const target = clamp(p.z0 * p.k, MIN_ZOOM, MAX_ZOOM);
   const applied = target / p.z0;
-  const nextTop = p.originY * applied - p.midY;
-  setZoom(target, () => { well.scrollTop = nextTop; });
+  const nextTop  = insets.top  + p.originY * applied - p.midY;
+  const nextLeft = insets.left + p.originX * applied - p.midX;
+  setZoom(target, () => {
+    well.scrollTop  = nextTop;
+    well.scrollLeft = nextLeft;
+  });
 }
 well.addEventListener('touchend', e => { if (pinch && e.touches.length < 2) endPinch(); });
 well.addEventListener('touchcancel', endPinch);
