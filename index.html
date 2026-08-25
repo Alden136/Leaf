@@ -164,6 +164,14 @@
     position: absolute; right: 9px; width: 7px; height: 1px;
     background: var(--ink); opacity: .22;
   }
+  #rail .bm {
+    position: absolute; right: 3px; width: 6px; height: 6px;
+    border-radius: 50%; background: var(--accent);
+  }
+  #rail .hm {
+    position: absolute; right: 18px; width: 4px; height: 3px; border-radius: 1px;
+    background: #D9A400; opacity: .85;
+  }
   #rail .thumb {
     position: absolute; right: 5px; width: 15px; height: 2px;
     background: var(--accent); border-radius: 2px;
@@ -366,6 +374,34 @@
   }
   body[data-textdebug="on"] .page canvas { opacity: .35; }
 
+  /* ── User highlights ──────────────────────────────────────────
+     Behind the transparent text layer, so selection still works over it.
+     Multiply reads like a real highlighter on paper; on an inverted page it
+     would go muddy, so night mode lightens instead. */
+  .hlLayer { position: absolute; inset: 0; z-index: 0; pointer-events: none; }
+  .hlBox { position: absolute; border-radius: 2px; mix-blend-mode: multiply; }
+  body[data-page="night"] .hlBox { mix-blend-mode: screen; opacity: .5; }
+
+  #selbar {
+    position: fixed; z-index: 45; display: none;
+    align-items: center; gap: 6px; padding: 7px 8px;
+    background: var(--ink); border-radius: 9px;
+    box-shadow: 0 4px 14px rgba(0,0,0,.3);
+  }
+  #selbar.open { display: flex; }
+  .sel-swatch {
+    width: 27px; height: 27px; border-radius: 50%;
+    border: 1.5px solid rgba(255,255,255,.35);
+  }
+  .sel-swatch:active { transform: scale(.9); }
+  .sel-sep { width: 1px; height: 20px; background: rgba(255,255,255,.22); }
+  .sel-act {
+    color: var(--housing); font-size: 13px; padding: 6px 9px; border-radius: 6px;
+  }
+  .sel-act:active { background: rgba(255,255,255,.16); }
+
+  .btn.filled svg { fill: currentColor; }
+
   /* ── Link layer ──────────────────────────────────────────────── */
   .linkLayer { position: absolute; inset: 0; z-index: 2; }
   .linkLayer a {
@@ -440,8 +476,6 @@
   .info-note strong { display: block; margin-bottom: 3px; }
 
   /* ── Outline pane ────────────────────────────────────────────── */
-  #outlineBtn { display: none; }
-  body.has-outline #outlineBtn { display: grid; }
 
   #outline {
     position: fixed; inset: 0; z-index: 40;
@@ -464,6 +498,10 @@
   }
   .ol-twist[aria-expanded="true"] svg { transform: rotate(90deg); }
   .ol-spacer { flex: none; width: 32px; }
+  .ol-dot {
+    flex: none; width: 12px; height: 12px; margin: 11px 10px 0 12px;
+    border-radius: 3px; border: 1px solid var(--rule);
+  }
   .ol-title {
     flex: 1; min-width: 0; text-align: left;
     padding: 8px 14px 8px 0; font-size: 14px; line-height: 1.35;
@@ -578,6 +616,9 @@
   <button class="btn" id="searchBtn" aria-pressed="false" aria-label="Find in document">
     <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6"/><path d="M15.5 15.5L20 20"/></svg>
   </button>
+  <button class="btn" id="bookmarkBtn" aria-pressed="false" aria-label="Bookmark this page">
+    <svg viewBox="0 0 24 24"><path d="M7 4h10v16l-5-4-5 4z"/></svg>
+  </button>
   <button class="btn" id="appearBtn" aria-pressed="false" aria-label="Appearance">
     <svg viewBox="0 0 24 24"><path d="M12 4a8 8 0 1 0 0 16z" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="8"/></svg>
   </button>
@@ -614,7 +655,7 @@
 <div id="outline">
   <header class="lib-head">
     <div>
-      <h2>Contents</h2>
+      <h2>Marks &amp; contents</h2>
       <span class="lib-usage" id="outlineSub"></span>
     </div>
     <button class="btn" id="outlineClose" aria-label="Close contents">
@@ -649,6 +690,8 @@
   <p>Open a PDF from your files, or share one to Leaf from any other app.</p>
   <button class="cta" id="emptyOpen">Open a PDF</button>
 </div>
+
+<div id="selbar" role="toolbar" aria-label="Selection actions"></div>
 
 <div id="status"></div>
 <input type="file" id="fileInput" accept="application/pdf,.pdf" hidden>
@@ -883,8 +926,9 @@ async function openBuffer(buffer, name, opts = {}) {
   textCache.clear(); hits = []; hitIndex = -1;
   activeQuery = ''; outline = null; destCache.clear();
   document.body.classList.remove('has-outline');
-  closeOutline(); closeDocInfo();
+  closeOutline(); closeDocInfo(); hideSelBar();
   docInfo = null; infoDirty = false;
+  marks = { bookmarks: [], highlights: [] };
   $('hits').textContent = ''; $('searchInput').value = '';
   $('jumpInput').max = doc.numPages;
 
@@ -901,7 +945,10 @@ async function openBuffer(buffer, name, opts = {}) {
   updateCounter();
   buildRail();
   clearStatus();
-  loadOutline();                       // reveals the Contents button if there is one
+  loadOutline();
+  await loadMarks();
+  updateBookmarkButton();
+  buildRail();
 
   if (resumePage > 1) status(`Resumed on page ${resumePage}`, false, 1800);
 
@@ -1061,7 +1108,8 @@ function mount(i) {
   el.dataset.n = i + 1;
   entry = { el, canvas: null, task: null, scale: 0,
             textEl: null, textTask: null, linkEl: null,
-            textDivs: null, items: null, norm: null, auxPending: null, marked: new Set() };
+            textDivs: null, items: null, norm: null, auxPending: null,
+            hlEl: null, marked: new Set() };
   live.set(i, entry);
   placeEl(i, entry);
   pagesEl.appendChild(el);
@@ -1164,6 +1212,7 @@ function renderVisible() {
     current = nowCurrent;
     updateCounter();
     moveThumb();
+    updateBookmarkButton();
     schedulePositionSave();
   }
   if (navTarget !== null && current === navTarget) navTarget = null;   // arrived
@@ -1430,6 +1479,7 @@ function dropAux(entry) {
   if (entry.textTask) { try { entry.textTask.cancel(); } catch {} entry.textTask = null; }
   if (entry.textEl) { entry.textEl.remove(); entry.textEl = null; }
   if (entry.linkEl) { entry.linkEl.remove(); entry.linkEl = null; }
+  if (entry.hlEl) { entry.hlEl.remove(); entry.hlEl = null; }
   entry.textDivs = null; entry.items = null; entry.norm = null;
   entry.auxPending = null; entry.marked?.clear();
 }
@@ -1475,7 +1525,12 @@ async function mountAux(i, entry, page, vp) {
   if (live.get(i) !== entry) { dropAux(entry); return; }   // scrolled away mid-render
 
   entry.textDivs = layer.textDivs;
+  // The item index is how a DOM selection is mapped back to normalised text.
+  for (let k = 0; k < entry.textDivs.length; k++) {
+    if (entry.textDivs[k]) entry.textDivs[k].dataset.item = k;
+  }
   applyHighlights(i, entry);
+  drawHighlights(i, entry);
   mountLinks(i, entry, page, vp);
 }
 
@@ -1698,20 +1753,83 @@ function buildOutline(items, depth, container) {
   }
 }
 
+function markRow(label, page, onOpen, onRemove, swatch) {
+  const row = document.createElement('div');
+  row.className = 'ol-row';
+
+  if (swatch) {
+    const dot = document.createElement('span');
+    dot.className = 'ol-dot';
+    dot.style.background = swatch;
+    row.appendChild(dot);
+  } else {
+    const gap = document.createElement('span');
+    gap.className = 'ol-spacer';
+    row.appendChild(gap);
+  }
+
+  const title = document.createElement('button');
+  title.className = 'ol-title';
+  title.textContent = label;
+  title.onclick = onOpen;
+  row.appendChild(title);
+
+  const tag = document.createElement('span');
+  tag.className = 'ol-page';
+  tag.textContent = page;
+  row.appendChild(tag);
+
+  const del = document.createElement('button');
+  del.className = 'btn';
+  del.setAttribute('aria-label', 'Remove');
+  del.innerHTML = '<svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg>';
+  del.onclick = e => { e.stopPropagation(); onRemove(); };
+  row.appendChild(del);
+  return row;
+}
+
 function renderOutline() {
   const list = $('outlineList');
   list.replaceChildren();
-  if (!outline?.length) {
+
+  const counts = [];
+  if (marks.bookmarks.length) counts.push(`${marks.bookmarks.length} bookmark${marks.bookmarks.length===1?'':'s'}`);
+  if (marks.highlights.length) counts.push(`${marks.highlights.length} highlight${marks.highlights.length===1?'':'s'}`);
+
+  if (marks.bookmarks.length) {
+    list.appendChild(section('Bookmarks'));
+    for (const p of marks.bookmarks) {
+      list.appendChild(markRow(`Page ${p}`, p,
+        () => { closeOutline(); goToPage(p); },
+        async () => {
+          marks.bookmarks = marks.bookmarks.filter(x => x !== p);
+          updateBookmarkButton(); buildRail(); await saveMarks(); renderOutline();
+        }));
+    }
+  }
+
+  if (marks.highlights.length) {
+    list.appendChild(section('Highlights'));
+    for (const hl of [...marks.highlights].sort((a, b) => a.page - b.page || a.start - b.start)) {
+      list.appendChild(markRow(hl.text || '(no text)', hl.page,
+        () => { closeOutline(); goToPage(hl.page); },
+        async () => { await removeHighlight(hl.id); renderOutline(); },
+        hl.color));
+    }
+  }
+
+  if (outline?.length) {
+    list.appendChild(section('Contents'));
+    counts.push(`${countOutline(outline)} entries`);
+    buildOutline(outline, 0, list);
+  } else if (!marks.bookmarks.length && !marks.highlights.length) {
     const blank = document.createElement('div');
     blank.className = 'lib-blank';
-    blank.textContent = 'This PDF has no embedded table of contents.';
+    blank.textContent = 'No bookmarks or highlights yet, and this PDF has no embedded table of contents.';
     list.appendChild(blank);
-    $('outlineSub').textContent = '';
-    return;
   }
-  const total = countOutline(outline);
-  $('outlineSub').textContent = `${total} entr${total === 1 ? 'y' : 'ies'}`;
-  buildOutline(outline, 0, list);
+
+  $('outlineSub').textContent = counts.join(' · ');
 }
 
 function openOutline() {
@@ -2193,9 +2311,269 @@ $('infoBtn').onclick = openDocInfo;
 $('infoClose').onclick = closeDocInfo;
 $('infoSave').onclick = saveDocInfo;
 
+/* ── Bookmarks and highlights ────────────────────────────────────
+   Both live on the library record, so both need the document to be in
+   the library.
+
+   A highlight is stored as an offset and length into the page's normalised
+   text — never as pixels. Geometry changes with every zoom, rotation and
+   re-render; text offsets do not. Drawing is the reverse of search: project
+   the stored range back onto the spans through the same position map, then
+   measure client rects at render time.
+   ─────────────────────────────────────────────────────────────── */
+
+const HL_COLORS = [
+  { name: 'Yellow', css: 'rgba(255, 214, 0, .45)' },
+  { name: 'Green',  css: 'rgba(64, 200, 110, .42)' },
+  { name: 'Blue',   css: 'rgba(70, 160, 255, .40)' },
+  { name: 'Pink',   css: 'rgba(255, 105, 170, .38)' },
+];
+
+let marks = { bookmarks: [], highlights: [] };
+
+async function loadMarks() {
+  marks = { bookmarks: [], highlights: [] };
+  if (!currentId) return;
+  try {
+    const rec = await dbGet('docs', currentId);
+    if (Array.isArray(rec?.bookmarks)) marks.bookmarks = rec.bookmarks.slice();
+    if (Array.isArray(rec?.highlights)) marks.highlights = rec.highlights.slice();
+  } catch { /* leave them empty */ }
+}
+
+async function saveMarks() {
+  if (!currentId) return false;
+  try {
+    const rec = await dbGet('docs', currentId);
+    if (!rec) return false;
+    rec.bookmarks = marks.bookmarks;
+    rec.highlights = marks.highlights;
+    await dbPut('docs', rec);
+    return true;
+  } catch (err) { console.warn('Could not save marks:', err); return false; }
+}
+
+function marksAvailable() {
+  if (!doc) return false;
+  if (!currentId) {
+    status('Bookmarks and highlights need the document to be in your library.', true, 4500);
+    return false;
+  }
+  return true;
+}
+
+/* ── Bookmarks ───────────────────────────────────────────────── */
+const isBookmarked = n => marks.bookmarks.includes(n);
+
+function updateBookmarkButton() {
+  const on = !!doc && isBookmarked(current);
+  const b = $('bookmarkBtn');
+  b.setAttribute('aria-pressed', String(on));
+  b.setAttribute('aria-label', on ? 'Remove bookmark' : 'Bookmark this page');
+  b.classList.toggle('filled', on);
+}
+
+async function toggleBookmark() {
+  if (!marksAvailable()) return;
+  const n = current;
+  const at = marks.bookmarks.indexOf(n);
+  if (at >= 0) marks.bookmarks.splice(at, 1);
+  else { marks.bookmarks.push(n); marks.bookmarks.sort((a, b) => a - b); }
+  updateBookmarkButton();
+  buildRail();
+  if (await saveMarks()) {
+    status(at >= 0 ? `Bookmark removed from page ${n}` : `Page ${n} bookmarked`, false, 1500);
+  } else {
+    // Don't leave a bookmark showing that will be gone next time.
+    status('That could not be saved, so the bookmark was undone.', true, 4000);
+    if (at >= 0) { marks.bookmarks.push(n); marks.bookmarks.sort((a, b) => a - b); }
+    else marks.bookmarks = marks.bookmarks.filter(x => x !== n);
+    updateBookmarkButton();
+    buildRail();
+  }
+}
+
+/* ── Mapping a DOM selection onto normalised text ─────────────── */
+
+/* Character offset of (node, offset) within a span, counting through any
+   <mark> elements search may have inserted. */
+function offsetWithin(span, node, offset) {
+  const walk = document.createTreeWalker(span, NodeFilter.SHOW_TEXT);
+  let acc = 0, t;
+  while ((t = walk.nextNode())) {
+    if (t === node) return acc + offset;
+    acc += t.data.length;
+  }
+  return acc;
+}
+
+/* A DOM Range covering [from, to) characters of a span's text. */
+function rangeIn(span, from, to) {
+  const walk = document.createTreeWalker(span, NodeFilter.SHOW_TEXT);
+  let acc = 0, sN = null, sO = 0, eN = null, eO = 0, t;
+  while ((t = walk.nextNode())) {
+    const len = t.data.length;
+    if (!sN && from < acc + len) { sN = t; sO = from - acc; }
+    if (to <= acc + len) { eN = t; eO = to - acc; break; }
+    acc += len;
+  }
+  if (!sN || !eN) return null;
+  const r = document.createRange();
+  try {
+    r.setStart(sN, clamp(sO, 0, sN.data.length));
+    r.setEnd(eN, clamp(eO, 0, eN.data.length));
+  } catch { return null; }
+  return r;
+}
+
+/* Normalised [start, len) covering the item/char span the user selected. */
+function normRangeFor(norm, startItem, startChar, endItem, endChar) {
+  let from = -1, to = -1;
+  for (let k = 0; k < norm.length; k++) {
+    const i = norm.posItem[k];
+    if (i < 0) continue;                       // inserted separator, no source
+    const c = norm.posChar[k];
+    const afterStart = i > startItem || (i === startItem && c >= startChar);
+    const beforeEnd  = i < endItem   || (i === endItem   && c <  endChar);
+    if (afterStart && beforeEnd) { if (from < 0) from = k; to = k + 1; }
+  }
+  return from < 0 ? null : { start: from, len: to - from };
+}
+
+/* Resolve the live selection to { pageIndex, entry, start, len, text }. */
+function describeSelection() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return null;
+  const range = sel.getRangeAt(0);
+
+  const spanOf = n => (n.nodeType === 1 ? n : n.parentElement)?.closest('[data-item]');
+  const startSpan = spanOf(range.startContainer);
+  const endSpan   = spanOf(range.endContainer);
+  if (!startSpan || !endSpan) return null;
+
+  const pageEl = startSpan.closest('.page');
+  if (!pageEl || endSpan.closest('.page') !== pageEl) return null;   // one page at a time
+
+  const pageIndex = Number(pageEl.dataset.n) - 1;
+  const entry = live.get(pageIndex);
+  if (!entry?.norm) return null;
+
+  const r = normRangeFor(
+    entry.norm,
+    Number(startSpan.dataset.item), offsetWithin(startSpan, range.startContainer, range.startOffset),
+    Number(endSpan.dataset.item),   offsetWithin(endSpan, range.endContainer, range.endOffset));
+  if (!r) return null;
+
+  return { pageIndex, entry, ...r, text: sel.toString().replace(/\s+/g, ' ').trim() };
+}
+
+/* ── Creating and drawing highlights ─────────────────────────── */
+async function addHighlight(color) {
+  if (!marksAvailable()) return;
+  const s = describeSelection();
+  if (!s) return status('Select some text on a single page first.', true, 3000);
+
+  marks.highlights.push({
+    id: `h${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    page: s.pageIndex + 1, start: s.start, len: s.len,
+    color, text: s.text.slice(0, 180), at: Date.now(),
+  });
+  window.getSelection()?.removeAllRanges();
+  hideSelBar();
+  drawHighlights(s.pageIndex, s.entry);
+  buildRail();
+  if (!(await saveMarks())) {
+    marks.highlights.pop();                 // roll back rather than lie about it
+    drawHighlights(s.pageIndex, s.entry);
+    buildRail();
+    status('That highlight could not be saved, so it was undone.', true, 4000);
+  }
+}
+
+async function removeHighlight(id) {
+  const at = marks.highlights.findIndex(h => h.id === id);
+  if (at < 0) return;
+  const page = marks.highlights[at].page;
+  marks.highlights.splice(at, 1);
+  const entry = live.get(page - 1);
+  if (entry) drawHighlights(page - 1, entry);
+  buildRail();
+  await saveMarks();
+}
+
+function drawHighlights(i, entry) {
+  if (entry.hlEl) { entry.hlEl.remove(); entry.hlEl = null; }
+  if (!entry.norm || !entry.textDivs) return;
+  const list = marks.highlights.filter(h => h.page === i + 1);
+  if (!list.length) return;
+
+  const layer = document.createElement('div');
+  layer.className = 'hlLayer';
+  const pageBox = entry.el.getBoundingClientRect();
+
+  for (const h of list) {
+    for (const [k, r] of matchToItemRanges(entry.norm, h.start, h.len)) {
+      const span = entry.textDivs[k];
+      if (!span) continue;
+      const range = rangeIn(span, r.from, r.to);
+      if (!range) continue;
+      for (const rect of range.getClientRects()) {
+        if (rect.width < 0.5 || rect.height < 0.5) continue;
+        const box = document.createElement('div');
+        box.className = 'hlBox';
+        box.style.background = h.color;
+        box.style.left   = `${rect.left - pageBox.left}px`;
+        box.style.top    = `${rect.top  - pageBox.top}px`;
+        box.style.width  = `${rect.width}px`;
+        box.style.height = `${rect.height}px`;
+        layer.appendChild(box);
+      }
+    }
+  }
+  if (!layer.children.length) return;
+  entry.el.appendChild(layer);
+  entry.hlEl = layer;
+}
+
+function redrawAllHighlights() {
+  for (const [i, entry] of live) drawHighlights(i, entry);
+}
+
+/* ── Selection toolbar ───────────────────────────────────────── */
+let selBarTimer = 0;
+
+function hideSelBar() { $('selbar').classList.remove('open'); }
+
+function positionSelBar() {
+  const sel = window.getSelection();
+  if (!sel || sel.isCollapsed || !sel.rangeCount) return hideSelBar();
+  const rect = sel.getRangeAt(0).getBoundingClientRect();
+  if (!rect.width && !rect.height) return hideSelBar();
+
+  const bar = $('selbar');
+  bar.classList.add('open');
+  const bw = bar.offsetWidth || 220, bh = bar.offsetHeight || 44;
+  let left = rect.left + rect.width / 2 - bw / 2;
+  left = clamp(left, 8, Math.max(8, window.innerWidth - bw - 8));
+  let top = rect.top - bh - 10;
+  if (top < insets.top + 6) top = Math.min(rect.bottom + 10, window.innerHeight - bh - 8);
+  bar.style.left = `${Math.round(left)}px`;
+  bar.style.top  = `${Math.round(top)}px`;
+}
+
+document.addEventListener('selectionchange', () => {
+  clearTimeout(selBarTimer);
+  selBarTimer = setTimeout(() => {
+    const sel = window.getSelection();
+    if (!sel || sel.isCollapsed || !describeSelection()) return hideSelBar();
+    positionSelBar();
+  }, 180);
+});
+
 /* ── Page rail ───────────────────────────────────────────────── */
 function buildRail() {
-  rail.querySelectorAll('.tick').forEach(t => t.remove());
+  rail.querySelectorAll('.tick, .bm, .hm').forEach(t => t.remove());
+  if (!doc) return;
   const n = doc.numPages;
   if (n <= 1) return;
   const step = n <= 60 ? 1 : Math.ceil(n / 60);
@@ -2205,6 +2583,17 @@ function buildRail() {
     tick.className = 'tick';
     tick.style.top = ((p - 1) / (n - 1) * 100) + '%';
     frag.appendChild(tick);
+  }
+  // Bookmarks and highlighted pages get their own marks on the rail, so you
+  // can see where your own annotations are without opening a list.
+  const at = p => ((p - 1) / Math.max(1, n - 1) * 100) + '%';
+  for (const p of marks.bookmarks) {
+    const d = document.createElement('div');
+    d.className = 'bm'; d.style.top = at(p); frag.appendChild(d);
+  }
+  for (const p of new Set(marks.highlights.map(x => x.page))) {
+    const d = document.createElement('div');
+    d.className = 'hm'; d.style.top = at(p); frag.appendChild(d);
   }
   rail.insertBefore(frag, rail.firstChild);
   moveThumb();
@@ -2564,6 +2953,32 @@ darkMedia.addEventListener?.('change', () => { if (uiPref === 'auto') applyAppea
 
 applyAppearance();
 
+(function buildSelBar() {
+  const bar = $('selbar');
+  for (const c of HL_COLORS) {
+    const b = document.createElement('button');
+    b.className = 'sel-swatch';
+    b.style.background = c.css;
+    b.title = c.name;
+    b.setAttribute('aria-label', `Highlight ${c.name.toLowerCase()}`);
+    b.onclick = () => addHighlight(c.css);
+    bar.appendChild(b);
+  }
+  const sep = document.createElement('div'); sep.className = 'sel-sep';
+  const copy = document.createElement('button');
+  copy.className = 'sel-act'; copy.textContent = 'Copy';
+  copy.onclick = async () => {
+    const t = window.getSelection()?.toString() ?? '';
+    if (!t) return;
+    try { await navigator.clipboard.writeText(t); status('Copied', false, 1200); }
+    catch { status('Could not copy.', true, 2500); }
+    window.getSelection()?.removeAllRanges();
+    hideSelBar();
+  };
+  bar.append(sep, copy);
+})();
+
+$('bookmarkBtn').onclick = toggleBookmark;
 $('appearBtn').onclick = () => {
   const opening = !$('appearPanel').classList.contains('open');
   closePanels();

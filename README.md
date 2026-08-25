@@ -77,8 +77,12 @@ empty files with no error anywhere — the buffer just quietly becomes length ze
 | Pinch | Zoom, re-rendered crisp on release |
 | Drag the right-edge rail | Scrub through pages |
 | Tap the page counter | Jump to a page number |
+| Type a number into search | Offers "Go to p.N" alongside the search |
 | List icon, top bar | Open the library |
-| Contents icon, top bar | Open the outline (only shown if the PDF has one) |
+| Contents icon, top bar | Bookmarks, highlights and the outline |
+| Bookmark icon, bottom bar | Bookmark the current page |
+| Select text | Colour swatches appear; tap one to highlight |
+| (i) icon, top bar | Document info and metadata editing |
 | Long-press on text | Select and copy |
 
 The circle button opens **Appearance**, which has two independent settings:
@@ -112,6 +116,21 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
   finding the visible page is a binary search over it. If you add anything to the
   scroll path, keep it away from `offsetTop`, `offsetHeight`, `getBoundingClientRect`
   and bare `getComputedStyle` — the insets are cached in `insets` for this reason.
+- **Panels sit above the on-screen keyboard.** Android Chrome defaults to
+  `interactive-widget=resizes-visual`: the keyboard shrinks the visual viewport
+  but not the layout viewport, so a `position: fixed; bottom:` panel stays pinned
+  *behind* the keyboard. The viewport meta asks for `resizes-content`, and a
+  `visualViewport` listener measures the gap into `--kb` for anything that
+  ignores it. Any new fixed-position element anchored to the bottom needs
+  `+ var(--kb)` in its offset.
+- **Navigation is instant over long distances, and holds a target.** Any write to
+  `scrollTop` cancels an in-flight smooth scroll where it stands, and two things
+  routinely write it: the reflow after a mixed-size page is measured, and the
+  resize when the on-screen keyboard opens or closes. An animated jump to page
+  450 therefore stopped around page 95. Jumps beyond three screens are now
+  instant, `scrollToPage` adopts the target page immediately rather than waiting
+  for the next render, and `navTarget` keeps reflows re-anchoring on the
+  destination instead of wherever scrolling had reached.
 - **Zoom swaps canvases rather than blanking them.** The old canvas stays on
   screen, stretched by CSS, until the sharper render is ready. Dropping it first
   makes every pinch flash empty.
@@ -126,10 +145,34 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
   highlighting and screen-reader output possible — a canvas alone offers none of
   those. It is a *sibling* of the canvas, not a parent, so the night-mode invert
   filter applies to the canvas only and highlights keep their colour.
-- **Highlighting is per text run.** pdf.js emits one span per positioned chunk,
-  so a phrase split across two runs still gets the page jump but not the
-  highlight. Fixing that properly means building a normalised page string with an
-  offset map back into the spans, which is how pdf.js's own find controller does it.
+- **Highlighting spans runs, lines and hyphens.** Each page is folded into one
+  normalised string (lowercased, accents stripped, ligatures split, whitespace
+  collapsed) alongside a map from every character back to the text item and
+  character it came from. Matches are found in the flat string and projected back
+  onto the spans, so a phrase split across two spans, across a line break, or
+  across a hyphenated break highlights across all the pieces.
+- **The folding path is written for speed, not elegance.** ASCII never touches
+  Unicode machinery; `String.normalize()` costs roughly 2 us per call and calling
+  it per character cost ~5 ms on a dense page, which a whole-document search
+  multiplied into seconds. Non-ASCII characters are folded once and memoised. The
+  position map is two `Int32Array`s rather than an array of objects — at one
+  object per character a cached document was retaining millions of them.
+- **Only the folded string is cached document-wide.** The position map is about
+  22 KB per page and is held only for pages currently on screen, then discarded
+  with the entry.
+- **Text layers wait for the scroll to settle.** A few hundred absolutely
+  positioned spans per page is the most expensive thing that can happen during a
+  fling, and it is invisible work while pages are flying past. The canvas never
+  waits; only text and links are deferred, by 150 ms of quiet.
+- **One text fetch per page.** `getTextContent()` feeds both the rendered layer
+  and the search index, so the match count and the highlight positions cannot
+  disagree. This relies on pdf.js creating exactly one div per item with a `str`
+  — items without one are marked-content boundaries and produce no div, so
+  `textDivs` runs parallel to the filtered item list. If you change the text
+  layer setup, that correspondence is the thing to preserve.
+- **Restoring is done from the item strings**, not by unpicking the DOM. Marked
+  spans are reset with `div.textContent = items[k].str` before each pass, which
+  is why repeated searching never compounds or corrupts the text.
 - **Links are restricted to http(s).** A PDF can name any URI scheme it likes,
   including `javascript:`. Internal links resolve through the same destination
   cache the outline uses.
@@ -144,6 +187,109 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
   in both places, which is what keeps the two settings from leaking into each
   other. If you add a token, put it on one side or the other.
 
+## Bookmarks and highlights
+
+Both live on the library record, so both need the document to be in the library.
+They show on the page rail — bookmarks as dots, highlighted pages as ticks — and
+are listed in the Marks & contents pane, where you can jump to one or remove it.
+
+**A highlight is stored as an offset and length into the page's normalised text,
+never as pixels.** Geometry changes with every zoom, rotation and re-render;
+text offsets do not. This reuses the position map built for search: creating a
+highlight maps the DOM selection back to text offsets, and drawing one runs the
+same projection in reverse, measuring client rects at render time. That is why a
+highlight stays put across zoom and reopening.
+
+Two details that follow from it:
+
+- **Spans carry a `data-item` index.** That is what maps a DOM selection back to
+  a text item. Selection offsets are counted by walking text nodes, so they
+  remain correct inside the `<mark>` elements search inserts.
+- **Highlights draw behind the text layer**, so selection still works over them.
+  Multiply blending reads like a real highlighter on paper; on an inverted night
+  page it would go muddy, so night mode lightens instead.
+
+Selections spanning two pages are rejected rather than half-stored, and a mark
+whose save fails is rolled back rather than left on screen to disappear later.
+
+## Metadata
+
+The (i) pane shows what pdf.js reports — page count, PDF version, dates,
+encryption, forms, signatures, XMP presence — and lets you edit Title, Author,
+Subject, Keywords, Creator and Producer.
+
+Editing needs a second library. **pdf.js is a reader and cannot write PDFs at
+all**, so saving lazy-loads pdf-lib (~520 KB, fetched only when you press Save,
+then cached by the service worker). Three things follow from that:
+
+- **Encrypted PDFs are read-only, deliberately.** pdf-lib's `ignoreEncryption`
+  does not decrypt — it copies still-encrypted streams into a file with no
+  encryption dictionary, and the result does not open in any reader. I verified
+  this: the rewritten file fails with `PasswordException` afterwards. Editing is
+  refused rather than risking the file. `info.EncryptFilterName` is the signal.
+- **The document must be in your library.** Saving needs the original bytes, and
+  pdf.js has already detached the buffer it was handed. They come back from the
+  IndexedDB copy, so a document opened while storage was unavailable can be
+  viewed but not edited.
+- **The result is verified before anything is replaced.** The rewritten bytes are
+  re-opened with pdf.js and the page count checked. If that fails, nothing is
+  written and the original is left alone. A file that no longer opens is far
+  worse than a title that did not change.
+
+Saving also downloads the edited file, and re-keys the library entry under its
+new content hash, carrying your reading position across.
+
+Two caveats surfaced in the pane itself: rewriting invalidates a digital
+signature, and a PDF carrying XMP may keep showing its old title in readers that
+prefer XMP over the standard fields.
+
+## Diagnosing extraction
+
+Document info → **Text extraction** checks the current page automatically and
+offers a scan across a spread of up to twelve pages. It separates four failures
+that all look identical from the outside:
+
+| Report | Meaning | Fix |
+| --- | --- | --- |
+| No text at all | A scan — pictures of words | Needs OCR; out of scope here |
+| Broken character map | Fonts lack a usable `ToUnicode` table, so extraction returns private-use or control code points. Structurally valid text made of the wrong characters | Nothing the reader can do; the PDF needs rebuilding |
+| Words are not separated | Phrases can never match, single words still can | — |
+| Multi-column layout | Phrase search can match across the gutter | Needs reading-order reconstruction |
+
+It also prints **what search actually sees** for the page, with private-use and
+control characters shown as `⟨E041⟩` so garbled text looks garbled rather than
+looking blank.
+
+The checks run on **raw** item text, not the normalised search string. That is
+deliberate: the normaliser folds control codes to spaces, which hides exactly
+the damage being looked for. A PDF with a broken map yields a search index of
+almost pure whitespace, and nothing about it looks wrong until you inspect the
+raw characters.
+
+A failed search now also explains itself instead of just saying "no matches".
+
+## When search finds nothing
+
+Two different failures look identical from the outside, so the app now
+distinguishes them:
+
+- **No text layer.** A scanned PDF is pictures of words. `getTextContent()`
+  returns nothing, so nothing can ever match. The app says so explicitly rather
+  than reporting "no matches". Fixing it needs OCR, which is out of scope here.
+- **Text present, no match.** Ordinary miss.
+
+Appearance → **Text layer → Reveal** draws the extracted text over a dimmed page.
+Empty boxes mean nothing was extracted; boxes offset from the print mean the
+layer is misaligned. Those are different problems with different fixes.
+
+### A limitation that is not a bug
+
+Text items arrive in content-stream order, not reading order. In a two-column
+layout that means the end of a line in column one is followed immediately by the
+start of the corresponding line in column two, so a phrase search can match
+across the gutter and produce a hit that looks wrong on the page. Every PDF text
+extractor has this; fixing it means reconstructing reading order from geometry.
+
 ## Things deliberately left out
 
 - No appearance memory — both themes still reset on launch. The library covers
@@ -154,6 +300,7 @@ Keyboard, if you ever open it on a desktop: arrows/PageUp/PageDown, Home, End,
   entries, but nothing is dropped automatically. If you want a cap, evict by
   oldest `openedAt` when `navigator.storage.estimate()` gets close to quota.
 - No annotation or form filling.
-- No highlight for matches spanning two text runs (see above).
-- No search result count per page — the panel counts pages containing the term,
-  not individual matches.
+- No regular-expression or whole-word search — matching is plain substring over
+  the folded text.
+- Dehyphenation always joins a hyphen at a line break. A genuine hyphenated
+  compound broken across lines becomes one word in the search index.
